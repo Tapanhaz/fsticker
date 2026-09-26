@@ -257,12 +257,13 @@ is attempted and the rest of the feed is unaffected.
 
 ### Schema
 
-With `auto_bootstrap_schema=True` (the default), nothing to set up by
-hand: on first successful connection the sink creates the table(s) it
-needs (`CREATE TABLE IF NOT EXISTS`) and, best-effort, upgrades them to
-TimescaleDB hypertables. If the `timescaledb` extension isn't installed
-on your server, or your database user lacks privilege to create it, the
-sink logs that once and quietly continues as plain Postgres tables —
+With `auto_bootstrap_schema=True` (the default), nothing *inside the
+database* to set up by hand: on first successful connection the sink
+creates the table(s) it needs (`CREATE TABLE IF NOT EXISTS`) and,
+best-effort, upgrades them to TimescaleDB hypertables. If the
+`timescaledb` extension isn't installed, or your
+database user lacks privilege to create it, the sink logs that once
+and quietly continues as plain Postgres tables —
 persistence still works, you just don't get hypertable
 chunking/compression. With `auto_bootstrap_schema=False`, the sink
 issues no DDL at all — you are responsible for creating matching
@@ -276,7 +277,11 @@ hand; `auto_bootstrap_schema=False` exists for locked-down environments
 where the app's database role genuinely can't be granted DDL privileges.
 
 Expected schema per table (`table_mode=TIMEFRAME` produces one of these
-per configured period, named `<table>_<period>`):
+per configured period, named `<table>_<period>`). The steps below are
+what `auto_bootstrap_schema=True` already does for you automatically;
+they're spelled out here as the exact DDL to run yourself if you're on
+`auto_bootstrap_schema=False`, or just want to see precisely what's
+being created.
 
 ```sql
 CREATE TABLE candles_60 (
@@ -296,6 +301,31 @@ CREATE TABLE candles_60 (
     oi_delta BIGINT,
     PRIMARY KEY (exchange, token, period, "time")
 );
+```
+
+-- Step 2: the integer-now function. Create this ONCE per database --
+-- it's shared by every hypertable you convert, not redeclared per table.
+-- Skip this step entirely if you already ran it for an earlier table.
+
+```sql
+CREATE OR REPLACE FUNCTION fsticker_sec_now() RETURNS BIGINT
+LANGUAGE SQL STABLE AS $$ SELECT EXTRACT(EPOCH FROM now())::BIGINT $$;
+```
+-- Step 3: convert to a hypertable. . chunk_interval (86400 = 1 day, in seconds) is yours to choose --
+-- fsticker itself scales this with the candle period when it bootstraps a
+-- table automatically; pick something similar for your own timeframe.
+
+```sql
+SELECT create_hypertable('candles_60', by_range('time', 86400::BIGINT),
+                          if_not_exists => TRUE);
+```
+
+-- Step 4: register the function against THIS table specifically. Repeat
+-- this one line (only this one) for every additional hypertable you create --
+-- 'fsticker_sec_now' already exists from step 2, don't recreate it.
+
+```sql
+SELECT set_integer_now_func('candles_60', 'fsticker_sec_now');
 ```
 
 See [`docs/timescaledb-setup.md`](https://github.com/Tapanhaz/fsticker/blob/main/docs/timescaledb-setup.md) for a full
