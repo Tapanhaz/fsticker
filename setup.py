@@ -235,6 +235,8 @@ class CMakeBuildExt(_build_ext):
             ext.extra_objects = _unique([*ext.extra_objects, *lib_files])
             if sys.platform.startswith("linux"):
                 ext.libraries = _unique([*ext.libraries, "resolv"])
+            elif sys.platform == "win32":
+                ext.libraries = _unique([*ext.libraries, "secur32", "shell32"])
 
 
 _cykit_kwargs = cykit_config.get_extension_kwargs(ssl=False)
