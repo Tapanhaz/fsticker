@@ -18,10 +18,9 @@ if(NOT RAPIDJSON_INCLUDE_DIR)
         GIT_TAG        v1.1.0
         GIT_SHALLOW    TRUE
         SOURCE_SUBDIR  __header_only_no_cmake__
-        PATCH_COMMAND  ${CMAKE_COMMAND} -E echo "[RapidJSON] Patching GCC13+ const-member bug (Tencent/rapidjson#718)"
-                COMMAND sed -i.bak
-                        "/GenericStringRef& operator=(const GenericStringRef& rhs) { s = rhs.s; length = rhs.length; }/d"
-                        <SOURCE_DIR>/include/rapidjson/document.h
+        PATCH_COMMAND  ${CMAKE_COMMAND}
+                       -DRAPIDJSON_HEADER=<SOURCE_DIR>/include/rapidjson/document.h
+                       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_rapidjson_const.cmake
         )
     FetchContent_MakeAvailable(rapidjson)
     set(RAPIDJSON_INCLUDE_DIR "${rapidjson_SOURCE_DIR}/include" CACHE PATH "" FORCE)
