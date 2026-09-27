@@ -259,6 +259,17 @@ _cykit_kwargs["include_dirs"] = _include_dirs
 
 _define_macros = list(_cykit_kwargs.get("define_macros") or [])
 
+# RapidJSON v1.1.0's endianness autodetection in rapidjson.h has no
+# branch for MSVC targeting ARM64 (only checks _M_IX86/_M_X64) and
+# hard-errors instead of silently guessing. Every cibuildwheel target
+# here -- x86_64, aarch64, arm64, AMD64, ARM64 -- is little-endian, so
+# pin it explicitly rather than patch rapidjson's detection for each
+# new little-endian arch it doesn't yet recognize.
+_rapidjson_endian = ("RAPIDJSON_ENDIAN", "0")
+if _rapidjson_endian not in _define_macros:
+    _define_macros.append(_rapidjson_endian)
+
+
 # Rapidjson not gonna fix this. Its better we silence the noise ::
 if sys.platform == "win32":
     _silence_iterator_base = (
