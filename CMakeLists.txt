@@ -31,6 +31,32 @@ if(NOT EXISTS "${RAPIDJSON_INCLUDE_DIR}/rapidjson/document.h")
 endif()
 message(STATUS "[RapidJSON] Using ${RAPIDJSON_INCLUDE_DIR}")
 
+set(FSTICKER_EXTRA_FASTFLOAT_INCLUDE_DIRS "" CACHE STRING
+    "Optional extra hint paths to check for fast_float/fast_float.h before fetching it")
+
+find_path(FASTFLOAT_INCLUDE_DIR NAMES fast_float/fast_float.h
+    HINTS ${FSTICKER_EXTRA_FASTFLOAT_INCLUDE_DIRS} ENV FASTFLOAT_INCLUDE_DIR)
+
+if(NOT FASTFLOAT_INCLUDE_DIR)
+    message(STATUS "[fast_float] Not found via FSTICKER_EXTRA_FASTFLOAT_INCLUDE_DIRS/env -- fetching header-only source.")
+    include(FetchContent)
+    FetchContent_Declare(fast_float
+        GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
+        GIT_TAG        v8.2.4
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  __header_only_no_cmake__
+        )
+    FetchContent_MakeAvailable(fast_float)
+    set(FASTFLOAT_INCLUDE_DIR "${fast_float_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+endif()
+
+if(NOT EXISTS "${FASTFLOAT_INCLUDE_DIR}/fast_float/fast_float.h")
+    message(FATAL_ERROR "fast_float header not found even after fetch: ${FASTFLOAT_INCLUDE_DIR}")
+endif()
+message(STATUS "[fast_float] Using ${FASTFLOAT_INCLUDE_DIR}")
+
+
+
 
 set(OPENSSL_PATHS_FILE "${CMAKE_CURRENT_BINARY_DIR}/openssl_paths.txt")
 

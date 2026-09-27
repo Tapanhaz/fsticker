@@ -105,6 +105,7 @@ class CMakeBuildExt(_build_ext):
     def run(self):
         self._configure_cmake()
         self._resolve_rapidjson()
+        self._resolve_fastfloat()
         self._resolve_openssl()
         self._resolve_postgres()
         super().run()
@@ -159,6 +160,20 @@ class CMakeBuildExt(_build_ext):
         for ext in self.extensions:
             if rapidjson_include not in ext.include_dirs:
                 ext.include_dirs.append(rapidjson_include)
+
+    def _resolve_fastfloat(self) -> None:
+        fastfloat_include = _read_cmake_cache_var(
+            CMAKE_BUILD_DIR, "FASTFLOAT_INCLUDE_DIR"
+        )
+        if not fastfloat_include:
+            raise RuntimeError(
+                "CMake configure didn't resolve FASTFLOAT_INCLUDE_DIR -- "
+                "check the [fast_float] messages in the configure output above."
+            )
+
+        for ext in self.extensions:
+            if fastfloat_include not in ext.include_dirs:
+                ext.include_dirs.append(fastfloat_include)
 
     def _resolve_openssl(self) -> None:
         paths = _read_cmake_paths_file(CMAKE_BUILD_DIR / "openssl_paths.txt")
