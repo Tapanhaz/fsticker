@@ -112,8 +112,13 @@ class CMakeBuildExt(_build_ext):
     def _platform_configure_args(self) -> list[str]:
         if sys.platform == "darwin":
             archs = re.findall(r"-arch\s+(\S+)", os.environ.get("ARCHFLAGS", ""))
+            args = []
             if archs:
-                return [f"-DCMAKE_OSX_ARCHITECTURES={';'.join(archs)}"]
+                args.append(f"-DCMAKE_OSX_ARCHITECTURES={';'.join(archs)}")
+            deployment_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+            if deployment_target:
+                args.append(f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}")
+            return args
         elif sys.platform == "win32" and not os.environ.get("CMAKE_GENERATOR"):
             arch = {
                 "win-amd64": "x64",
