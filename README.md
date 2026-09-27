@@ -70,7 +70,7 @@ pip install fsticker --no-binary fsticker \
 
 ### Requirements
 
-- **Python 3.9 – 3.14** (CPython only)
+- **Python 3.11 – 3.14** (CPython only)
 
 
 ## Quickstart (sync)

@@ -39,7 +39,7 @@ jobs:
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
           CIBW_BUILD_VERBOSITY: 3
-          CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*
+          CIBW_BUILD: cp311-* cp312-* cp313-* cp314-*
           CIBW_SKIP: "*t-* pp* *-win32 *-manylinux_i686 *-musllinux_*"
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_BUILD: pip install setuptools wheel Cython cmake delvewheel
