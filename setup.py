@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import multiprocessing
 import os
 import re
@@ -43,6 +44,14 @@ _WINDOWS_STATIC_SYSTEM_LIBS = (
 
 def _unique(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def _supports_dict_setitem_known_hash() -> bool:
+    try:
+        ctypes.pythonapi._PyDict_SetItem_KnownHash  # noqa: B018
+    except AttributeError:
+        return False
+    return True
 
 
 def _read_cmake_paths_file(path: Path) -> dict[str, str]:
@@ -248,16 +257,21 @@ for _extra in (str(ROOT / "fsticker" / "include"), str(PKG_DIR)):
 _cykit_kwargs["include_dirs"] = _include_dirs
 
 
+_define_macros = list(_cykit_kwargs.get("define_macros") or [])
+
 # Rapidjson not gonna fix this. Its better we silence the noise ::
 if sys.platform == "win32":
-    _define_macros = list(_cykit_kwargs.get("define_macros") or [])
     _silence_iterator_base = (
         "_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING",
         None,
     )
     if _silence_iterator_base not in _define_macros:
         _define_macros.append(_silence_iterator_base)
-    _cykit_kwargs["define_macros"] = _define_macros
+
+if _supports_dict_setitem_known_hash():
+    _define_macros.append(("FSTICKER_HAVE_DICT_SETITEM_KNOWNHASH", None))
+
+_cykit_kwargs["define_macros"] = _define_macros
 
 
 ext = Extension(

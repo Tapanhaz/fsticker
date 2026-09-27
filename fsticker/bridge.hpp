@@ -28,6 +28,12 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(FSTICKER_HAVE_DICT_SETITEM_KNOWNHASH)
+// Private CPython symbol, no public header declares it as of 3.13
+extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key, PyObject *item, Py_hash_t hash);
+#endif
+
+
 namespace fsticker::pybridge {
 
     namespace {
@@ -175,7 +181,11 @@ namespace fsticker::pybridge {
             PyObject *val = field_to_py(v);
             if (!val)
                 return false;
+#if defined(FSTICKER_HAVE_DICT_SETITEM_KNOWNHASH)
             const int rc = _PyDict_SetItem_KnownHash(d, k.py, val, k.hash);
+#else
+            const int rc = PyDict_SetItem(d, k.py, val);
+#endif
             Py_DECREF(val);
             return rc == 0;
         }
