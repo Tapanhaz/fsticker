@@ -1,0 +1,10 @@
+include CMakeLists.txt
+include pyproject.toml
+
+recursive-include fsticker *.pyx *.pxd *.py *.cpp *.hpp *.h
+
+recursive-include examples *.cpp *.py
+
+prune _cmake_build
+prune build
+global-exclude __pycache__ *.py[cod]

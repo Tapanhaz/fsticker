@@ -1,0 +1,25 @@
+{
+   glibc_resolv_conf_static_lifetime
+   Memcheck:Leak
+   match-leak-kinds: definite
+   ...
+   fun:__resolv_conf_allocate
+}
+{
+   boost_asio_resolver_thread_tls
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:allocate_dtv_entry
+   fun:allocate_and_init
+   fun:tls_get_addr_tail
+}
+{
+   pthread_create_dtv_possibly_lost
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.34
+}

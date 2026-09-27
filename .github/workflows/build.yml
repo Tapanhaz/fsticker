@@ -1,0 +1,90 @@
+name: Build and Publish to PyPI
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            cibw_archs: "x86_64"
+          - os: ubuntu-26.04-arm
+            cibw_archs: "aarch64"
+          - os: windows-2025-vs2026
+            cibw_archs: "AMD64"
+          - os: windows-11-vs2026-arm
+            cibw_archs: "ARM64"
+          - os: macos-15
+            cibw_archs: "arm64"
+          - os: macos-15-intel
+            cibw_archs: "x86_64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel==4.1.1
+
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD_VERBOSITY: 3
+          CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*
+          CIBW_SKIP: "*t-* pp* *-win32 *-manylinux_i686 *-musllinux_*"
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          CIBW_BEFORE_BUILD: pip install setuptools wheel Cython cmake delvewheel
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: "delocate-wheel -w {dest_dir} -v {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            delvewheel repair -w {dest_dir}
+            --add-path "%FSTICKER_OPENSSL_BIN_DIR%"
+            {wheel}
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_TEST_COMMAND: python -c "import fsticker; print('Import successful')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ matrix.cibw_archs }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-sdist
+          path: dist/*.tar.gz
+
+  upload_pypi:
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-26.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
+      - run: ls -R dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
