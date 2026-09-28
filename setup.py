@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import multiprocessing
 import os
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -52,6 +54,30 @@ def _supports_dict_setitem_known_hash() -> bool:
     except AttributeError:
         return False
     return True
+
+
+@functools.cache
+def _compiler_default_include_dirs(cxx: str) -> frozenset[str]:
+    try:
+        proc = subprocess.run(
+            [cxx, "-E", "-Wp,-v", "-x", "c++", "-std=c++20", "-"],
+            input="",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return frozenset()
+    dirs: set[str] = set()
+    in_list = False
+    for line in proc.stderr.splitlines():
+        if line.startswith("#include") and "search starts here" in line:
+            in_list = True
+        elif line.startswith("End of search list"):
+            in_list = False
+        elif in_list:
+            dirs.add(os.path.realpath(line.strip().split(" ")[0]))
+    return frozenset(dirs)
 
 
 def _read_cmake_paths_file(path: Path) -> dict[str, str]:
@@ -119,6 +145,27 @@ class CMakeBuildExt(_build_ext):
         self._resolve_postgres()
         super().run()
 
+    def _add_isystem_dirs(self, dirs: Iterable[str]) -> None:
+        dirs = list(dirs)
+        if sys.platform == "win32":
+            for ext in self.extensions:
+                for d in dirs:
+                    if d not in ext.include_dirs:
+                        ext.include_dirs.append(d)
+            return
+
+        cxx = os.environ.get("CXX", "c++")
+        default_dirs = _compiler_default_include_dirs(cxx)
+
+        flags: list[str] = []
+        for d in dirs:
+            if os.path.realpath(d) in default_dirs:
+                continue
+            flags.extend(("-isystem", d))
+        for ext in self.extensions:
+            ext.extra_compile_args = list(ext.extra_compile_args or [])
+            ext.extra_compile_args += flags
+
     def _platform_configure_args(self) -> list[str]:
         if sys.platform == "darwin":
             archs = re.findall(r"-arch\s+(\S+)", os.environ.get("ARCHFLAGS", ""))
@@ -166,9 +213,10 @@ class CMakeBuildExt(_build_ext):
                 "check the [RapidJSON] messages in the configure output above."
             )
 
-        for ext in self.extensions:
-            if rapidjson_include not in ext.include_dirs:
-                ext.include_dirs.append(rapidjson_include)
+        # for ext in self.extensions:
+        #    if rapidjson_include not in ext.include_dirs:
+        #        ext.include_dirs.append(rapidjson_include)
+        self._add_isystem_dirs([rapidjson_include])
 
     def _resolve_fastfloat(self) -> None:
         fastfloat_include = _read_cmake_cache_var(
@@ -180,9 +228,10 @@ class CMakeBuildExt(_build_ext):
                 "check the [fast_float] messages in the configure output above."
             )
 
-        for ext in self.extensions:
-            if fastfloat_include not in ext.include_dirs:
-                ext.include_dirs.append(fastfloat_include)
+        # for ext in self.extensions:
+        #    if fastfloat_include not in ext.include_dirs:
+        #        ext.include_dirs.append(fastfloat_include)
+        self._add_isystem_dirs([fastfloat_include])
 
     def _resolve_openssl(self) -> None:
         paths = _read_cmake_paths_file(CMAKE_BUILD_DIR / "openssl_paths.txt")
@@ -220,7 +269,7 @@ class CMakeBuildExt(_build_ext):
             )
 
         for ext in self.extensions:
-            ext.include_dirs = _unique([*ext.include_dirs, *include_dirs])
+            # ext.include_dirs = _unique([*ext.include_dirs, *include_dirs])
             ext.library_dirs = _unique([*library_dirs, *ext.library_dirs])
             ext.libraries = _unique(
                 [
@@ -229,6 +278,7 @@ class CMakeBuildExt(_build_ext):
                 ]
             )
             ext.extra_objects = _unique([*ext.extra_objects, *objects])
+        self._add_isystem_dirs(include_dirs)
 
     def _resolve_postgres(self) -> None:
         paths = _read_cmake_paths_file(CMAKE_BUILD_DIR / "openssl_paths.txt")
@@ -240,12 +290,13 @@ class CMakeBuildExt(_build_ext):
             # means FSTICKER_ENABLE_TIMESCALE=OFF for this build
             return
         for ext in self.extensions:
-            ext.include_dirs = _unique([*ext.include_dirs, *include_dirs])
+            # ext.include_dirs = _unique([*ext.include_dirs, *include_dirs])
             ext.extra_objects = _unique([*ext.extra_objects, *lib_files])
             if sys.platform.startswith("linux"):
                 ext.libraries = _unique([*ext.libraries, "resolv"])
             elif sys.platform == "win32":
                 ext.libraries = _unique([*ext.libraries, "secur32", "shell32"])
+        self._add_isystem_dirs(include_dirs)
 
 
 _cykit_kwargs = cykit_config.get_extension_kwargs(ssl=False)
