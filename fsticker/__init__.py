@@ -7,6 +7,7 @@ from fsticker.async_feed import AsyncMergedFeed
 from fsticker.feed_merge import (
     AccessType,
     Credentials,
+    DispatchMode,
     FeedType,
     LogLevel,
     MergedFeed,
@@ -18,6 +19,7 @@ __all__ = [
     "AccessType",
     "AsyncMergedFeed",
     "Credentials",
+    "DispatchMode",
     "FeedType",
     "LogLevel",
     "MergedFeed",

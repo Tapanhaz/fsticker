@@ -44,6 +44,10 @@ class LogLevel(IntEnum):
     WARN = 2
     ERROR = 3
 
+class DispatchMode(StrEnum):
+    QUEUED = "queued"
+    INLINE = "inline"
+
 
 cdef bint _on_main_thread() except -1:
     return threading.current_thread() is threading.main_thread()
@@ -142,6 +146,10 @@ cdef class MergedFeed:
         object _on_stalled
         object _on_shutdown
         object _on_log
+        object _dispatch_mode
+        object _tick_thread
+        object _candle_thread
+        object _dispatch_stop
         object _notify_sock
         object _notify_candle_sock
         object _json_decoder
@@ -159,6 +167,7 @@ cdef class MergedFeed:
             list candle_timeframes=None,
             dict exchange_anchors={"NSE": 13500, "BSE": 13500, "NFO": 13500, "BFO": 13500, "MCX": 12600, "CDS": 12600, "BCD": 12600},
             object timescale=None,
+            object dispatch_mode=DispatchMode.QUEUED,
             int tick_queue_capacity=100_000, 
             bint tick_queue_overwrite=True, 
             int candle_queue_capacity=100_000, 
@@ -172,6 +181,17 @@ cdef class MergedFeed:
             PyTimeframeSpec tf
             vector[PyExchangeAnchor] anchors
             PyExchangeAnchor anchor
+
+        if dispatch_mode not in (DispatchMode.QUEUED, DispatchMode.INLINE):
+            raise ValueError(
+                "MergedFeed.dispatch_mode must be DispatchMode.QUEUED or "
+                f"DispatchMode.INLINE, got {dispatch_mode!r}"
+            )
+        self._dispatch_mode = dispatch_mode
+        self._dispatch_stop = threading.Event()
+        self._tick_thread = None
+        self._candle_thread = None
+
 
         for b in brokers:
             spec = PyBrokerSpec()
@@ -255,6 +275,7 @@ cdef class MergedFeed:
 
     def __dealloc__(self):
         cdef bint joined
+        self._stop_dispatch_threads()
         if self._bridge is not NULL:
             with nogil:
                 joined = self._bridge.close()
@@ -285,12 +306,16 @@ cdef class MergedFeed:
     property on_tick:
         def __set__(self, cb):
             self._on_tick = cb 
-            self._bridge.set_tick_callback(<PyObject*>cb)
+            #self._bridge.set_tick_callback(<PyObject*>cb)
+            if self._dispatch_mode == DispatchMode.INLINE:
+                self._bridge.set_tick_callback(<PyObject*>cb)
 
     property on_candle:
         def __set__(self, cb):
             self._on_candle = cb
-            self._bridge.set_candle_callback(<PyObject*>cb)
+            #self._bridge.set_candle_callback(<PyObject*>cb)
+            if self._dispatch_mode == DispatchMode.INLINE:
+                self._bridge.set_candle_callback(<PyObject*>cb)
 
 
     property on_order:
@@ -382,6 +407,81 @@ cdef class MergedFeed:
     cpdef void _end_candles_wait(self):
         self._bridge.end_candles_wait()
 
+    def _tick_worker(self):
+        sock = self._notify_sock
+        stop = self._dispatch_stop
+        while not stop.is_set():
+            self._begin_ticks_wait()
+            tick = self._pop_tick()
+            if tick is not None:
+                self._end_ticks_wait()
+                cb = self._on_tick
+                if cb is not None:
+                    try:
+                        cb(tick)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    sock.recv(64) 
+                except OSError:
+                    pass
+                self._end_ticks_wait()
+
+    def _candle_worker(self):
+        sock = self._notify_candle_sock
+        stop = self._dispatch_stop
+        while not stop.is_set():
+            self._begin_candles_wait()
+            payload = self._pop_candle()
+            if payload is not None:
+                self._end_candles_wait()
+                cb = self._on_candle
+                if cb is not None:
+                    try:
+                        cb(payload)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    sock.recv(64)
+                except OSError:
+                    pass
+                self._end_candles_wait()
+
+    def _start_dispatch_threads(self):
+        if self._dispatch_mode != DispatchMode.QUEUED:
+            return
+        self._dispatch_stop.clear()
+        
+        if self._on_tick is not None:
+            self._notify_sock = self._enable_async_ticks()
+            self._notify_sock.setblocking(True)
+            self._notify_sock.settimeout(0.5)  
+            self._tick_thread = threading.Thread(
+                target=self._tick_worker, name="fsticker-tick-dispatch", daemon=True
+            )
+            self._tick_thread.start()
+        if self._on_candle is not None:
+            self._notify_candle_sock = self._enable_async_candles()
+            self._notify_candle_sock.setblocking(True)
+            self._notify_candle_sock.settimeout(0.5)
+            self._candle_thread = threading.Thread(
+                target=self._candle_worker, name="fsticker-candle-dispatch", daemon=True
+            )
+            self._candle_thread.start()
+
+    def _stop_dispatch_threads(self):
+        self._dispatch_stop.set()
+        if self._tick_thread is not None:
+            self._tick_thread.join(timeout=5.0)
+            self._tick_thread = None
+        if self._candle_thread is not None:
+            self._candle_thread.join(timeout=5.0)
+            self._candle_thread = None
+
 
     cpdef void start(
         self, 
@@ -413,6 +513,8 @@ cdef class MergedFeed:
             self.on_shutdown = on_shutdown
         if on_log      is not None:
             self.on_log      = on_log
+
+        self._start_dispatch_threads()
 
         self._bridge.start()
         self._started = True
@@ -476,29 +578,32 @@ cdef class MergedFeed:
             raise RuntimeError("MergedFeed.run() called before start()")
         grace_ms = 0.0 if grace_ms < 0.0 else (2.0e9 if grace_ms > 2.0e9 else grace_ms)
 
-        if handle_signals:
-            if not main_thread:
-                raise RuntimeError("run(handle_signals=True) needs the main thread; "
-                                   "pass handle_signals=False")
-            with nogil:
-                rc = self._bridge.run(True, <int>grace_ms)
-            if rc == -3:
-                raise RuntimeError("another MergedFeed.run() already handles SIGINT/SIGTERM; "
-                                   "pass handle_signals=False")
-            if rc == -4:
-                raise RuntimeError("fsticker: internal error while waiting for shutdown")
-            if rc > 0:
-                self._bridge.reraise(rc)
-                PyErr_CheckSignals()  
-        else:
-            try:
-                self._bridge.run_passive(main_thread)
-                closed = True
-            finally:
-                if not closed:
-                    self.stop()
+        try:
+            if handle_signals:
+                if not main_thread:
+                    raise RuntimeError("run(handle_signals=True) needs the main thread; "
+                                       "pass handle_signals=False")
                 with nogil:
-                    self._bridge.join_all()
+                    rc = self._bridge.run(True, <int>grace_ms)
+                if rc == -3:
+                    raise RuntimeError("another MergedFeed.run() already handles SIGINT/SIGTERM; "
+                                       "pass handle_signals=False")
+                if rc == -4:
+                    raise RuntimeError("fsticker: internal error while waiting for shutdown")
+                if rc > 0:
+                    self._bridge.reraise(rc)
+                    PyErr_CheckSignals()  
+            else:
+                try:
+                    self._bridge.run_passive(main_thread)
+                    closed = True
+                finally:
+                    if not closed:
+                        self.stop()
+                    with nogil:
+                        self._bridge.join_all()
+        finally:
+            self._stop_dispatch_threads()
 
     @property
     def broker_count(self):
