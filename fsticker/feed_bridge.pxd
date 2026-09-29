@@ -66,6 +66,7 @@ cdef extern from "bridge.hpp" namespace "fsticker::pybridge":
         void set_shutdown_callback(PyObject* callable)
         void set_log_callback(PyObject* callable)
         void set_candle_callback(PyObject* callable)
+        void set_candle_gap_callback(PyObject* callable)
         void configure_candles(vector[PyTimeframeSpec] specs, vector[PyExchangeAnchor] anchors)
         void configure_timescale(PyTimescaleParams params)
 

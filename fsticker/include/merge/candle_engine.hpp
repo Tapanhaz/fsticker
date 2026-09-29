@@ -132,6 +132,24 @@ namespace fsticker::merge {
             table_.erase(instrument);
         }
 
+        [[nodiscard]] static std::int64_t bucket_start(std::int64_t ft,
+                                                       std::int64_t anchor,
+                                                       std::int64_t period_s) noexcept {
+            return period_start_for(ft, anchor, period_s);
+        }
+
+        [[nodiscard]] std::optional<std::int64_t> next_deadline() const {
+            if (pending_finalize_.empty())
+                return std::nullopt;
+            return pending_finalize_.begin()->first;
+        }
+
+        [[nodiscard]] bool consume_earlier_deadline_flag() noexcept {
+            const bool f      = earlier_deadline_;
+            earlier_deadline_ = false;
+            return f;
+        }
+
     private:
         struct Bucket {
             std::int64_t period_start = 0;
@@ -235,10 +253,14 @@ namespace fsticker::merge {
 
                     is_new_candle = true;
 
-                    if (spec.auto_finalize)
+                    if (spec.auto_finalize) {
+                        const std::int64_t deadline =
+                            period_start + period_s + spec.auto_finalize_grace.count();
+                        if (pending_finalize_.empty() || deadline < pending_finalize_.begin()->first)
+                            earlier_deadline_ = true;
                         pending_finalize_.emplace(
-                            period_start + period_s + spec.auto_finalize_grace.count(),
-                            PendingFinalize {instrument_key, slot_index, period_start});
+                            deadline, PendingFinalize {instrument_key, slot_index, period_start});
+                    }
                 } else {
                     c.high  = std::max(c.high, *price);
                     c.low   = std::min(c.low, *price);
@@ -303,6 +325,7 @@ namespace fsticker::merge {
         ExchangeAnchors                              anchors_;
         std::unordered_map<std::string, Instrument>  table_;
         std::multimap<std::int64_t, PendingFinalize> pending_finalize_;
+        bool                                         earlier_deadline_ = false;
     };
 
 } // namespace fsticker::merge

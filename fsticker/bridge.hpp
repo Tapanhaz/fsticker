@@ -352,6 +352,51 @@ namespace fsticker::pybridge {
         return d;
     }
 
+    inline PyObject *gap_to_pydict(const fsticker::merge::CandleGap &g) {
+        PyObject *d = PyDict_New();
+        if (!d)
+            return nullptr;
+
+        PyObject *broker =
+            PyUnicode_FromStringAndSize(g.broker.data(), static_cast<Py_ssize_t>(g.broker.size()));
+        PyObject *tokens  = PyList_New(static_cast<Py_ssize_t>(g.tokens.size()));
+        PyObject *periods = PyList_New(static_cast<Py_ssize_t>(g.periods.size()));
+        if (!broker || !tokens || !periods)
+            goto fail;
+
+        for (std::size_t i = 0; i < g.tokens.size(); ++i) {
+            PyObject *s = PyUnicode_FromStringAndSize(g.tokens[i].data(),
+                                                      static_cast<Py_ssize_t>(g.tokens[i].size()));
+            if (!s)
+                goto fail;
+            PyList_SET_ITEM(tokens, static_cast<Py_ssize_t>(i), s);
+        }
+        for (std::size_t i = 0; i < g.periods.size(); ++i) {
+            PyObject *e =
+                Py_BuildValue("{s:L,s:L}", "period", static_cast<long long>(g.periods[i].first),
+                              "time", static_cast<long long>(g.periods[i].second));
+            if (!e)
+                goto fail;
+            PyList_SET_ITEM(periods, static_cast<Py_ssize_t>(i), e);
+        }
+        if (PyDict_SetItemString(d, "broker", broker) != 0 ||
+            PyDict_SetItemString(d, "tokens", tokens) != 0 ||
+            PyDict_SetItemString(d, "periods", periods) != 0)
+            goto fail;
+
+        Py_DECREF(broker);
+        Py_DECREF(tokens);
+        Py_DECREF(periods);
+        return d;
+
+    fail:
+        Py_XDECREF(broker);
+        Py_XDECREF(tokens);
+        Py_XDECREF(periods);
+        Py_DECREF(d);
+        return nullptr;
+    }
+
     struct PyBrokerSpec {
         std::string name;
         std::string ws_endpoint;
@@ -537,6 +582,27 @@ namespace fsticker::pybridge {
                 fsticker::emit_log(level, fsticker::kDebug, fsticker::LogCallback {},
                                    broker + ": " + std::string(msg));
             });
+
+
+            feed_->set_candle_gap_callback([this](const fsticker::merge::CandleGap &g) {
+                PyGILState_STATE gs = PyGILState_Ensure();
+                if (gap_cb_.callable) {
+                    PyObject *d = gap_to_pydict(g);
+                    if (d) {
+                        PyObject *args = PyTuple_New(1);
+                        if (args) {
+                            PyTuple_SET_ITEM(args, 0, d);
+                            invoke(gap_cb_.callable, args);
+                        } else {
+                            Py_DECREF(d);
+                            PyErr_Print();
+                        }
+                    } else {
+                        PyErr_Print();
+                    }
+                }
+                PyGILState_Release(gs);
+            });
         }
 
         ~PyMergedFeedBridge() {
@@ -583,6 +649,10 @@ namespace fsticker::pybridge {
 
         void set_candle_callback(PyObject *callable) {
             candle_cb_.set(callable);
+        }
+
+        void set_candle_gap_callback(PyObject *callable) {
+            gap_cb_.set(callable);
         }
 
         void configure_candles(std::vector<PyTimeframeSpec>  specs,
@@ -909,6 +979,7 @@ namespace fsticker::pybridge {
         PyCallableSlot shutdown_cb_;
         PyCallableSlot candle_cb_;
         PyCallableSlot log_cb_;
+        PyCallableSlot gap_cb_;
 
         std::function<void(const fsticker::merge::Tick &)> tick_dispatch_ =
             [](const fsticker::merge::Tick &) {};

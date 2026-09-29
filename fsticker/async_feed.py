@@ -88,6 +88,8 @@ class AsyncMergedFeed:
         self._dispatch_stalled = _noop
         self._on_log: Callback | None = None
         self._dispatch_log = _noop
+        self._on_candle_gap: Callback | None = None
+        self._dispatch_candle_gap = _noop
 
     async def _process_tick_sync(self, tick: object) -> None:
         self._on_tick(tick)
@@ -209,6 +211,26 @@ class AsyncMergedFeed:
         else:
             self._dispatch_log = self._dispatch_sync_log
 
+    def _dispatch_sync_candle_gap(self, *args: object) -> None:
+        self._on_candle_gap(*args)
+
+    def _dispatch_async_candle_gap(self, *args: object) -> None:
+        self._loop.create_task(self._on_candle_gap(*args))
+
+    @property
+    def on_candle_gap(self) -> Callback | None:
+        return self._on_candle_gap
+
+    @on_candle_gap.setter
+    def on_candle_gap(self, cb: Callback | None) -> None:
+        self._on_candle_gap = cb
+        if cb is None:
+            self._dispatch_candle_gap = _noop
+        elif inspect.iscoroutinefunction(cb):
+            self._dispatch_candle_gap = self._dispatch_async_candle_gap
+        else:
+            self._dispatch_candle_gap = self._dispatch_sync_candle_gap
+
     def _dispatch_sync_open(self, *args: object) -> None:
         self._on_open_cb(*args)
 
@@ -259,6 +281,7 @@ class AsyncMergedFeed:
         on_close: Callback | None = None,
         on_stalled: Callback | None = None,
         on_log: Callback | None = None,
+        on_candle_gap: Callback | None = None,
     ) -> AsyncMergedFeed:
         if on_tick is not None:
             self.on_tick = on_tick
@@ -276,6 +299,8 @@ class AsyncMergedFeed:
             self.on_stalled = on_stalled
         if on_log is not None:
             self.on_log = on_log
+        if on_candle_gap is not None:
+            self.on_candle_gap = on_candle_gap
 
         self._loop = asyncio.get_running_loop()
         self._closed = asyncio.Event()
@@ -302,6 +327,9 @@ class AsyncMergedFeed:
         )
         self._feed.on_log = lambda b, lvl, m: loop.call_soon_threadsafe(
             self._dispatch_log, b, lvl, m
+        )
+        self._feed.on_candle_gap = lambda p: loop.call_soon_threadsafe(
+            self._dispatch_candle_gap, p
         )
         self._feed.on_shutdown = lambda: loop.call_soon_threadsafe(self._closed.set)
 

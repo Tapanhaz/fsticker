@@ -146,6 +146,7 @@ cdef class MergedFeed:
         object _on_stalled
         object _on_shutdown
         object _on_log
+        object _on_candle_gap
         object _dispatch_mode
         object _tick_thread
         object _candle_thread
@@ -267,6 +268,7 @@ cdef class MergedFeed:
         self._on_stalled = None
         self._on_shutdown = None
         self._on_log = None
+        self._on_candle_gap = None
         self._notify_sock = None
         self._notify_candle_sock = None
         self._on_candle = None
@@ -358,6 +360,11 @@ cdef class MergedFeed:
         def __set__(self, cb):
             self._on_log = cb
             self._bridge.set_log_callback(<PyObject*>cb)
+    
+    property on_candle_gap:
+        def __set__(self, cb):
+            self._on_candle_gap = cb
+            self._bridge.set_candle_gap_callback(<PyObject*>cb)
 
     cpdef object _enable_async_ticks(self):
         self._bridge.set_tick_queue_limits(<size_t>self._tick_queue_capacity, self._tick_queue_overwrite)
@@ -424,9 +431,10 @@ cdef class MergedFeed:
                         traceback.print_exc()
             else:
                 try:
-                    sock.recv(64) 
+                    sock.recv(64)
                 except OSError:
-                    pass
+                    self._end_ticks_wait()
+                    return
                 self._end_ticks_wait()
 
     def _candle_worker(self):
@@ -448,7 +456,8 @@ cdef class MergedFeed:
                 try:
                     sock.recv(64)
                 except OSError:
-                    pass
+                    self._end_candles_wait()
+                    return
                 self._end_candles_wait()
 
     def _start_dispatch_threads(self):
@@ -459,7 +468,6 @@ cdef class MergedFeed:
         if self._on_tick is not None:
             self._notify_sock = self._enable_async_ticks()
             self._notify_sock.setblocking(True)
-            self._notify_sock.settimeout(0.5)  
             self._tick_thread = threading.Thread(
                 target=self._tick_worker, name="fsticker-tick-dispatch", daemon=True
             )
@@ -467,7 +475,6 @@ cdef class MergedFeed:
         if self._on_candle is not None:
             self._notify_candle_sock = self._enable_async_candles()
             self._notify_candle_sock.setblocking(True)
-            self._notify_candle_sock.settimeout(0.5)
             self._candle_thread = threading.Thread(
                 target=self._candle_worker, name="fsticker-candle-dispatch", daemon=True
             )
@@ -475,6 +482,16 @@ cdef class MergedFeed:
 
     def _stop_dispatch_threads(self):
         self._dispatch_stop.set()
+        if self._tick_thread is not None and self._notify_sock is not None:
+            try:
+                self._notify_sock.send(b"\0")
+            except OSError:
+                pass
+        if self._candle_thread is not None and self._notify_candle_sock is not None:
+            try:
+                self._notify_candle_sock.send(b"\0")
+            except OSError:
+                pass
         if self._tick_thread is not None:
             self._tick_thread.join(timeout=5.0)
             self._tick_thread = None
@@ -493,7 +510,8 @@ cdef class MergedFeed:
         object on_close=None, 
         object on_stalled=None, 
         object on_shutdown=None,
-        object on_log=None
+        object on_log=None,
+        object on_candle_gap=None
     ):
         if on_tick     is not None: 
             self.on_tick     = on_tick
@@ -513,6 +531,8 @@ cdef class MergedFeed:
             self.on_shutdown = on_shutdown
         if on_log      is not None:
             self.on_log      = on_log
+        if on_candle_gap is not None:
+            self.on_candle_gap = on_candle_gap
 
         self._start_dispatch_threads()
 

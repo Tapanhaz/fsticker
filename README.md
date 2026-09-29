@@ -1,6 +1,6 @@
 # fsticker
 
-[![PyPI](https://img.shields.io/pypi/v/fsticker.svg)](https://pypi.org/project/fsticker/)
+[![PyPI](https://img.shields.io/pypi/v/fsticker.svg?color=blue)](https://pypi.org/project/fsticker/)
 [![Downloads](https://static.pepy.tech/badge/fsticker)](https://pepy.tech/project/fsticker)
 [![Python versions](https://img.shields.io/pypi/pyversions/fsticker.svg)](https://pypi.org/project/fsticker/)
 [![Build](https://github.com/Tapanhaz/fsticker/actions/workflows/build.yml/badge.svg)](https://github.com/Tapanhaz/fsticker/actions/workflows/build.yml)
@@ -359,6 +359,30 @@ Registers callbacks and begins connecting every configured broker:
 | `on_open`     | `(broker, payload)` on connect       |
 | `on_close`    | `(broker,)` on disconnect            |
 | `on_stalled`  | `(broker, consecutive_failures)`     |
+| `on_candle_gap` | one dict, see below                |
+
+**`on_candle_gap`** fires when a broker disconnect leaves one or more
+tokens with *no* connected broker, so the candles currently forming for
+them are missing ticks. A token still carried by another live broker
+never appears. Requires `candle_timeframes`.
+
+```python
+{
+    "broker": "shoonya",  # ================>  the disconnect of the broker that took 
+    "tokens": ["NSE|26000", "NSE|26009"],   # the last carrier tokens that went dark
+    "periods": [                            # candle buckets open at that moment
+        {"period": 60,  "time": 1790238960},
+        {"period": 300, "time": 1790238900},
+    ],
+}
+```
+
+`period`/`time` match the fields in `on_candle`, so you can key straight
+into your stored candles, e.g. to schedule a historical fetch after the
+bucket closes and replace that row. It runs inline on the broker's
+thread: hand real work off to your own thread. Tokens with different
+exchange session anchors (e.g. NSE and MCX) produce one event per anchor
+group.
 
 Every callback is optional and independent — a sync `def` or `async def`
 callback both work in async implementation.

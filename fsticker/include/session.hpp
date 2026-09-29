@@ -296,7 +296,7 @@ namespace fsticker {
             if (on_connected_)
                 on_connected_();
             start_read();
-            arm_heartbeat_timer();
+            arm_heartbeat_timer(last_activity_ + params_.idle_ping_timeout);
         }
 
         void start_read() {
@@ -399,11 +399,9 @@ namespace fsticker {
                 on_disconnected_(ec, last_close_code_, last_close_reason_, http_status_);
         }
 
-        static constexpr std::chrono::milliseconds kHeartbeatCheckInterval {250};
-
-        void arm_heartbeat_timer() {
+        void arm_heartbeat_timer(std::chrono::steady_clock::time_point when) {
             auto self = shared_from_this();
-            heartbeat_timer_.expires_after(kHeartbeatCheckInterval);
+            heartbeat_timer_.expires_at(when);
             heartbeat_timer_.async_wait([self](beast::error_code ec) {
                 if (ec)
                     return;
@@ -417,20 +415,24 @@ namespace fsticker {
             const auto now = std::chrono::steady_clock::now();
 
             if (ping_awaiting_reply_) {
-                if (now - ping_sent_at_ >= params_.ping_reply_timeout) {
+                const auto reply_deadline = ping_sent_at_ + params_.ping_reply_timeout;
+                if (now >= reply_deadline)
                     return fail(net::error::timed_out);
-                }
-            } else if (now - last_activity_ >= params_.idle_ping_timeout) {
-                ping_awaiting_reply_ = true;
-                ping_sent_at_        = now;
-                if (on_log_)
-                    on_log_(kDebug, "heartbeat: sending idle ping after " +
-                                        std::to_string(params_.idle_ping_timeout.count()) +
-                                        "ms idle, payload=" + params_.ping_payload);
-                send_ping(params_.ping_payload);
+                return arm_heartbeat_timer(reply_deadline);
             }
 
-            arm_heartbeat_timer();
+            const auto idle_deadline = last_activity_ + params_.idle_ping_timeout;
+            if (now < idle_deadline)
+                return arm_heartbeat_timer(idle_deadline);
+
+            ping_awaiting_reply_ = true;
+            ping_sent_at_        = now;
+            if (on_log_)
+                on_log_(kDebug, "heartbeat: sending idle ping after " +
+                                    std::to_string(params_.idle_ping_timeout.count()) +
+                                    "ms idle, payload=" + params_.ping_payload);
+            send_ping(params_.ping_payload);
+            arm_heartbeat_timer(now + params_.ping_reply_timeout);
         }
 
         void note_activity() {

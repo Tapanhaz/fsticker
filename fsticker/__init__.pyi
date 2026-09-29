@@ -99,6 +99,10 @@ class MergedFeed:
     def on_log(self) -> Callable[[str, int, str], Any] | None: ...
     @on_log.setter
     def on_log(self, cb: Callable[[str, int, str], Any] | None) -> None: ...
+    @property
+    def on_candle_gap(self) -> Callable[[dict[str, Any]], Any] | None: ...
+    @on_candle_gap.setter
+    def on_candle_gap(self, cb: Callable[[dict[str, Any]], Any] | None) -> None: ...
     def __init__(
         self,
         brokers: list[Credentials],
@@ -131,6 +135,7 @@ class MergedFeed:
         on_stalled: Callable[[str, Any], Any] | None = None,
         on_shutdown: Callable[[], Any] | None = None,
         on_log: Callable[[str, int, str], Any] | None = None,
+        on_candle_gap: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None: ...
     def stop(self) -> None: ...
     def subscribe(
@@ -162,6 +167,7 @@ class AsyncMergedFeed:
     on_close: Callable[[str], Any] | None
     on_stalled: Callable[[str, Any], Any] | None
     on_log: Callable[[str, int, str], Any] | None
+    on_candle_gap: Callable[[dict[str, Any]], Any] | None
 
     def __init__(
         self,
@@ -193,6 +199,7 @@ class AsyncMergedFeed:
         on_close: Callable[[str], Any] | None = None,
         on_stalled: Callable[[str, Any], Any] | None = None,
         on_log: Callable[[str, int, str], Any] | None = None,
+        on_candle_gap: Callable[[dict[str, Any]], Any] | None = None,
     ) -> AsyncMergedFeed: ...
     async def subscribe(
         self,
