@@ -7,6 +7,7 @@
 
 #define PY_SSIZE_T_CLEAN
 #include "async_candle_bridge.hpp"
+#include "async_gap_report_bridge.hpp"
 #include "async_tick_bridge.hpp"
 #include "merge/merger_all.hpp"
 #include "signal_guard.hpp"
@@ -397,6 +398,89 @@ namespace fsticker::pybridge {
         return nullptr;
     }
 
+    inline PyObject *gap_report_to_pydict(const fsticker::merge::CandleGapReport &r) {
+        PyObject *d = PyDict_New();
+        if (!d)
+            return nullptr;
+
+        PyObject *token =
+            PyUnicode_FromStringAndSize(r.token.data(), static_cast<Py_ssize_t>(r.token.size()));
+        PyObject *broker =
+            PyUnicode_FromStringAndSize(r.broker.data(), static_cast<Py_ssize_t>(r.broker.size()));
+        PyObject *periods = PyList_New(static_cast<Py_ssize_t>(r.periods.size()));
+        if (!token || !broker || !periods)
+            goto fail;
+
+        for (std::size_t i = 0; i < r.periods.size(); ++i) {
+            const auto &pr = r.periods[i];
+            PyObject   *pd = PyDict_New();
+            if (!pd)
+                goto fail;
+
+            PyObject *period_val = PyLong_FromLongLong(pr.period);
+            if (!period_val || PyDict_SetItemString(pd, "period", period_val) != 0) {
+                Py_XDECREF(period_val);
+                Py_DECREF(pd);
+                goto fail;
+            }
+            Py_DECREF(period_val);
+
+            if (pr.has_range) {
+                PyObject *s = PyLong_FromLongLong(pr.start);
+                PyObject *e = PyLong_FromLongLong(pr.end);
+                if (!s || !e || PyDict_SetItemString(pd, "start", s) != 0 ||
+                    PyDict_SetItemString(pd, "end", e) != 0) {
+                    Py_XDECREF(s);
+                    Py_XDECREF(e);
+                    Py_DECREF(pd);
+                    goto fail;
+                }
+                Py_DECREF(s);
+                Py_DECREF(e);
+            }
+            if (!pr.partial.empty()) {
+                PyObject *plist = PyList_New(static_cast<Py_ssize_t>(pr.partial.size()));
+                if (!plist) {
+                    Py_DECREF(pd);
+                    goto fail;
+                }
+                for (std::size_t j = 0; j < pr.partial.size(); ++j) {
+                    PyObject *v = PyLong_FromLongLong(pr.partial[j]);
+                    if (!v) {
+                        Py_DECREF(plist);
+                        Py_DECREF(pd);
+                        goto fail;
+                    }
+                    PyList_SET_ITEM(plist, static_cast<Py_ssize_t>(j), v);
+                }
+                if (PyDict_SetItemString(pd, "partial", plist) != 0) {
+                    Py_DECREF(plist);
+                    Py_DECREF(pd);
+                    goto fail;
+                }
+                Py_DECREF(plist);
+            }
+            PyList_SET_ITEM(periods, static_cast<Py_ssize_t>(i), pd); // steals pd
+        }
+
+        if (PyDict_SetItemString(d, "token", token) != 0 ||
+            PyDict_SetItemString(d, "broker", broker) != 0 ||
+            PyDict_SetItemString(d, "periods", periods) != 0)
+            goto fail;
+
+        Py_DECREF(token);
+        Py_DECREF(broker);
+        Py_DECREF(periods);
+        return d;
+
+    fail:
+        Py_XDECREF(token);
+        Py_XDECREF(broker);
+        Py_XDECREF(periods);
+        Py_DECREF(d);
+        return nullptr;
+    }
+
     struct PyBrokerSpec {
         std::string name;
         std::string ws_endpoint;
@@ -421,6 +505,7 @@ namespace fsticker::pybridge {
         bool      live                        = false;
         bool      auto_finalize               = false;
         long long auto_finalize_grace_seconds = 4;
+        bool      omit_possible_partial       = false;
     };
 
     struct PyTimescaleParams {
@@ -603,6 +688,30 @@ namespace fsticker::pybridge {
                 }
                 PyGILState_Release(gs);
             });
+
+            feed_->set_candle_gap_report_callback([this](const fsticker::merge::CandleGapReport &r) {
+                if (async_gap_reports_) {
+                    async_gap_reports_->push(r);
+                    return;
+                }
+                PyGILState_STATE gs = PyGILState_Ensure();
+                if (gap_report_cb_.callable) {
+                    PyObject *d = gap_report_to_pydict(r);
+                    if (d) {
+                        PyObject *args = PyTuple_New(1);
+                        if (args) {
+                            PyTuple_SET_ITEM(args, 0, d);
+                            invoke(gap_report_cb_.callable, args);
+                        } else {
+                            Py_DECREF(d);
+                            PyErr_Print();
+                        }
+                    } else {
+                        PyErr_Print();
+                    }
+                }
+                PyGILState_Release(gs);
+            });
         }
 
         ~PyMergedFeedBridge() {
@@ -655,6 +764,43 @@ namespace fsticker::pybridge {
             gap_cb_.set(callable);
         }
 
+        void set_candle_gap_report_callback(PyObject *callable) {
+            gap_report_cb_.set(callable);
+        }
+
+        void enable_async_gap_reports(int notify_fd) {
+            async_gap_reports_ = std::make_unique<AsyncGapReportBridge>(
+                notify_fd, gap_report_capacity_, gap_report_overwrite_);
+        }
+
+        std::size_t dropped_gap_reports() const {
+            return async_gap_reports_ ? async_gap_reports_->dropped() : 0;
+        }
+
+        void set_gap_report_queue_limits(std::size_t capacity, bool overwrite) {
+            gap_report_capacity_  = capacity;
+            gap_report_overwrite_ = overwrite;
+        }
+
+        PyObject *pop_gap_report_as_pydict() {
+            if (!async_gap_reports_)
+                Py_RETURN_NONE;
+            auto item = async_gap_reports_->try_pop();
+            if (!item)
+                Py_RETURN_NONE;
+            return gap_report_to_pydict(*item);
+        }
+
+        void begin_gap_reports_wait() {
+            if (async_gap_reports_)
+                async_gap_reports_->begin_wait();
+        }
+
+        void end_gap_reports_wait() {
+            if (async_gap_reports_)
+                async_gap_reports_->end_wait();
+        }
+
         void configure_candles(std::vector<PyTimeframeSpec>  specs,
                                std::vector<PyExchangeAnchor> anchors = {}) {
             std::vector<fsticker::merge::TimeframeSpec> cpp_specs;
@@ -662,7 +808,7 @@ namespace fsticker::pybridge {
             for (const auto &s : specs)
                 cpp_specs.push_back(fsticker::merge::TimeframeSpec {
                     std::chrono::seconds(s.seconds), s.live, s.auto_finalize,
-                    std::chrono::seconds(s.auto_finalize_grace_seconds)});
+                    std::chrono::seconds(s.auto_finalize_grace_seconds), s.omit_possible_partial});
 
             fsticker::merge::ExchangeAnchors cpp_anchors;
             for (const auto &a : anchors)
@@ -980,6 +1126,7 @@ namespace fsticker::pybridge {
         PyCallableSlot candle_cb_;
         PyCallableSlot log_cb_;
         PyCallableSlot gap_cb_;
+        PyCallableSlot gap_report_cb_;
 
         std::function<void(const fsticker::merge::Tick &)> tick_dispatch_ =
             [](const fsticker::merge::Tick &) {};
@@ -987,15 +1134,18 @@ namespace fsticker::pybridge {
             [](const std::vector<fsticker::merge::Candle> &) {};
 
 
-        std::unique_ptr<AsyncTickBridge>   async_ticks_;
-        std::unique_ptr<AsyncCandleBridge> async_candles_;
-        std::size_t                        tick_capacity_    = 100000;
-        bool                               tick_overwrite_   = true;
-        std::size_t                        candle_capacity_  = 100000;
-        bool                               candle_overwrite_ = true;
-        std::atomic<bool>                  closed_flag_ {false};
-        std::mutex                         waiters_mutex_;
-        std::vector<fsticker::Waker *>     waiters_;
+        std::unique_ptr<AsyncTickBridge>      async_ticks_;
+        std::unique_ptr<AsyncCandleBridge>    async_candles_;
+        std::unique_ptr<AsyncGapReportBridge> async_gap_reports_;
+        std::size_t                           gap_report_capacity_  = 10000;
+        bool                                  gap_report_overwrite_ = true;
+        std::size_t                           tick_capacity_        = 100000;
+        bool                                  tick_overwrite_       = true;
+        std::size_t                           candle_capacity_      = 100000;
+        bool                                  candle_overwrite_     = true;
+        std::atomic<bool>                     closed_flag_ {false};
+        std::mutex                            waiters_mutex_;
+        std::vector<fsticker::Waker *>        waiters_;
     };
 
 } // namespace fsticker::pybridge

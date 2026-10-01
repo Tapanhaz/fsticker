@@ -103,10 +103,20 @@ class MergedFeed:
     def on_candle_gap(self) -> Callable[[dict[str, Any]], Any] | None: ...
     @on_candle_gap.setter
     def on_candle_gap(self, cb: Callable[[dict[str, Any]], Any] | None) -> None: ...
+    @property
+    def on_candle_gap_report(self) -> Callable[[dict[str, Any]], Any] | None: ...
+    @on_candle_gap_report.setter
+    def on_candle_gap_report(
+        self, cb: Callable[[dict[str, Any]], Any] | None
+    ) -> None: ...
     def __init__(
         self,
         brokers: list[Credentials],
-        candle_timeframes: list[tuple[int, bool, bool] | tuple[int, bool, bool, float]]
+        candle_timeframes: list[
+            tuple[int, bool, bool]
+            | tuple[int, bool, bool, float]
+            | tuple[int, bool, bool, float, bool]
+        ]
         | None = None,
         exchange_anchors: dict[str, int] = {
             "NSE": 13500,
@@ -136,6 +146,7 @@ class MergedFeed:
         on_shutdown: Callable[[], Any] | None = None,
         on_log: Callable[[str, int, str], Any] | None = None,
         on_candle_gap: Callable[[dict[str, Any]], Any] | None = None,
+        on_candle_gap_report: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None: ...
     def stop(self) -> None: ...
     def subscribe(
@@ -158,6 +169,8 @@ class MergedFeed:
     def dropped_ticks(self) -> int: ...
     @property
     def dropped_candles(self) -> int: ...
+    @property
+    def dropped_gap_reports(self) -> int: ...
 
 class AsyncMergedFeed:
     on_tick: Callable[[Any], Any] | None
@@ -168,11 +181,16 @@ class AsyncMergedFeed:
     on_stalled: Callable[[str, Any], Any] | None
     on_log: Callable[[str, int, str], Any] | None
     on_candle_gap: Callable[[dict[str, Any]], Any] | None
+    on_candle_gap_report: Callable[[dict[str, Any]], Any] | None
 
     def __init__(
         self,
         brokers: list[Credentials],
-        candle_timeframes: list[tuple[int, bool, bool] | tuple[int, bool, bool, float]]
+        candle_timeframes: list[
+            tuple[int, bool, bool]
+            | tuple[int, bool, bool, float]
+            | tuple[int, bool, bool, float, bool]
+        ]
         | None = None,
         exchange_anchors: dict[str, int] = {
             "NSE": 13500,
@@ -200,6 +218,7 @@ class AsyncMergedFeed:
         on_stalled: Callable[[str, Any], Any] | None = None,
         on_log: Callable[[str, int, str], Any] | None = None,
         on_candle_gap: Callable[[dict[str, Any]], Any] | None = None,
+        on_candle_gap_report: Callable[[dict[str, Any]], Any] | None = None,
     ) -> AsyncMergedFeed: ...
     async def subscribe(
         self,

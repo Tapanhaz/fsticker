@@ -20,6 +20,14 @@ def on_candle(payload):
     print(f"Candle :: {payload}")
 
 
+def on_candle_gap(payload):
+    print("Outage started ::", payload)
+
+
+def on_candle_gap_report(payload):
+    print("Outage resolved, affected candles ::", payload)
+
+
 def on_error(broker: str, msg: str):  # sync callbacks works too
     print(f"error :: [{broker}] {msg}")
 
@@ -68,9 +76,16 @@ async def main():
                 60,
                 True,
                 True,
-                3,
-            ),  # 1-min, live: partials + completed, auto finalizing after 3 sec of timeframe completion ( default 4)
-            (180, False, True),  # 5-min, closed-only, auto finalizing
+                4,
+                True,
+            ),  # 1-min, live: partials + completed, auto finalize grace period, omit partial ( mid session outage)
+            (
+                180,
+                False,
+                True,
+                4,
+                True,
+            ),  # 3-min, closed-only, auto finalize grace period, omit partial ( mid session outage)
         ],
     )
 
@@ -82,6 +97,8 @@ async def main():
         on_open=on_open,
         on_close=on_close,
         on_stalled=on_stalled,
+        on_candle_gap=on_candle_gap,
+        on_candle_gap_report=on_candle_gap_report,
     )
 
     # Safe to call before, during, or after connecting.

@@ -18,6 +18,14 @@ def on_candle(payload):
     print("Candle :: ", payload)
 
 
+def on_candle_gap(payload):
+    print("Outage started ::", payload)
+
+
+def on_candle_gap_report(payload):
+    print("Outage resolved, affected candles ::", payload)
+
+
 # Everything below is per-broker, all of these always receives the broker's name as its first argument +>
 
 
@@ -83,8 +91,20 @@ def main():
     feed = fsticker.MergedFeed(
         brokers,
         candle_timeframes=[
-            (60, True, False),  # 1-min, live: partials + completed
-            (180, False, False),  # 3-min, closed-only
+            (
+                60,
+                False,
+                True,
+                4,
+                True,
+            ),  # 1-min, closed only, auto finalize grace period, omit partial ( mid session outage)
+            (
+                300,
+                False,
+                True,
+                4,
+                True,
+            ),  # 5-min, closed-only, auto finalize grace period, omit partial ( mid session outage)
         ],
         timescale=TimescaleConfig(
             host="localhost",
@@ -105,6 +125,8 @@ def main():
         on_close=on_close,
         on_stalled=on_stalled,
         on_shutdown=on_shutdown,
+        on_candle_gap=on_candle_gap,
+        on_candle_gap_report=on_candle_gap_report,
         # on_log=on_log
     )
 
