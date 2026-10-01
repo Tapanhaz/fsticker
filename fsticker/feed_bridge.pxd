@@ -33,6 +33,7 @@ cdef extern from "bridge.hpp" namespace "fsticker::pybridge":
         bint live
         bint auto_finalize
         long long auto_finalize_grace_seconds
+        bint omit_possible_partial
 
     cdef cppclass PyExchangeAnchor:
         PyExchangeAnchor()
@@ -66,6 +67,8 @@ cdef extern from "bridge.hpp" namespace "fsticker::pybridge":
         void set_shutdown_callback(PyObject* callable)
         void set_log_callback(PyObject* callable)
         void set_candle_callback(PyObject* callable)
+        void set_candle_gap_callback(PyObject* callable)
+        void set_candle_gap_report_callback(PyObject* callable)
         void configure_candles(vector[PyTimeframeSpec] specs, vector[PyExchangeAnchor] anchors)
         void configure_timescale(PyTimescaleParams params)
 
@@ -74,7 +77,7 @@ cdef extern from "bridge.hpp" namespace "fsticker::pybridge":
         void begin_ticks_wait()
         void end_ticks_wait()
         void set_tick_queue_limits(size_t capacity, bint overwrite)
-        size_t dropped_ticks()
+        size_t dropped_ticks()        
 
         void enable_async_candles(int notify_fd)
         PyObject* pop_candle_as_py() except NULL
@@ -82,6 +85,13 @@ cdef extern from "bridge.hpp" namespace "fsticker::pybridge":
         void end_candles_wait()
         void set_candle_queue_limits(size_t capacity, bint overwrite)
         size_t dropped_candles()
+
+        void enable_async_gap_reports(int notify_fd)
+        PyObject* pop_gap_report_as_pydict() except NULL
+        void begin_gap_reports_wait()
+        void end_gap_reports_wait()
+        void set_gap_report_queue_limits(size_t capacity, bint overwrite)
+        size_t dropped_gap_reports()
 
         void start()
         void stop()

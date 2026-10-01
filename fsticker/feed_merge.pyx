@@ -44,6 +44,10 @@ class LogLevel(IntEnum):
     WARN = 2
     ERROR = 3
 
+class DispatchMode(StrEnum):
+    QUEUED = "queued"
+    INLINE = "inline"
+
 
 cdef bint _on_main_thread() except -1:
     return threading.current_thread() is threading.main_thread()
@@ -142,8 +146,16 @@ cdef class MergedFeed:
         object _on_stalled
         object _on_shutdown
         object _on_log
+        object _on_candle_gap
+        object _on_candle_gap_report
+        object _dispatch_mode
+        object _tick_thread
+        object _candle_thread
+        object _gap_report_thread
+        object _dispatch_stop
         object _notify_sock
         object _notify_candle_sock
+        object _notify_gap_report_sock
         object _json_decoder
         bint _started
 
@@ -151,6 +163,8 @@ cdef class MergedFeed:
         bint _tick_queue_overwrite
         int _candle_queue_capacity
         bint _candle_queue_overwrite
+        int _gap_report_queue_capacity
+        bint _gap_report_queue_overwrite
 
 
     def __init__(
@@ -159,6 +173,7 @@ cdef class MergedFeed:
             list candle_timeframes=None,
             dict exchange_anchors={"NSE": 13500, "BSE": 13500, "NFO": 13500, "BFO": 13500, "MCX": 12600, "CDS": 12600, "BCD": 12600},
             object timescale=None,
+            object dispatch_mode=DispatchMode.QUEUED,
             int tick_queue_capacity=100_000, 
             bint tick_queue_overwrite=True, 
             int candle_queue_capacity=100_000, 
@@ -172,6 +187,17 @@ cdef class MergedFeed:
             PyTimeframeSpec tf
             vector[PyExchangeAnchor] anchors
             PyExchangeAnchor anchor
+
+        if dispatch_mode not in (DispatchMode.QUEUED, DispatchMode.INLINE):
+            raise ValueError(
+                "MergedFeed.dispatch_mode must be DispatchMode.QUEUED or "
+                f"DispatchMode.INLINE, got {dispatch_mode!r}"
+            )
+        self._dispatch_mode = dispatch_mode
+        self._dispatch_stop = threading.Event()
+        self._tick_thread = None
+        self._candle_thread = None
+
 
         for b in brokers:
             spec = PyBrokerSpec()
@@ -192,28 +218,38 @@ cdef class MergedFeed:
         self._tick_queue_overwrite = tick_queue_overwrite
         self._candle_queue_capacity = candle_queue_capacity
         self._candle_queue_overwrite = candle_queue_overwrite
+        self._gap_report_queue_capacity = 10_000
+        self._gap_report_queue_overwrite = True
+        self._gap_report_thread = None
+        self._notify_gap_report_sock = None
 
         self._bridge = new PyMergedFeedBridge(specs)
 
 
         if candle_timeframes:
             for tf_spec in candle_timeframes:
-                if len(tf_spec) == 4:
+                if len(tf_spec) == 5:
+                    seconds, live, auto_finalize, grace, omit_partial = tf_spec
+                elif len(tf_spec) == 4:
                     seconds, live, auto_finalize, grace = tf_spec
+                    omit_partial = False
                 elif len(tf_spec) == 3:
                     seconds, live, auto_finalize = tf_spec
                     grace = 4.0
+                    omit_partial = False
                 else:
                     raise ValueError(
                         "each candle_timeframes entry must be a 3-tuple "
-                        "(seconds, live, auto_finalize) or a 4-tuple adding "
-                        f"auto_finalize_grace_seconds, got {tf_spec!r}"
+                        "(seconds, live, auto_finalize), a 4-tuple adding "
+                        "auto_finalize_grace_seconds, or a 5-tuple adding "
+                        f"omit_possible_partial, got {tf_spec!r}"
                     )
                 tf = PyTimeframeSpec()
                 tf.seconds = <long long>seconds
                 tf.live = <bint>live
                 tf.auto_finalize = <bint>auto_finalize
                 tf.auto_finalize_grace_seconds = <long long>grace
+                tf.omit_possible_partial = <bint>omit_partial
                 tf_specs.push_back(tf)
                 
             if exchange_anchors:
@@ -247,6 +283,8 @@ cdef class MergedFeed:
         self._on_stalled = None
         self._on_shutdown = None
         self._on_log = None
+        self._on_candle_gap = None
+        self._on_candle_gap_report = None
         self._notify_sock = None
         self._notify_candle_sock = None
         self._on_candle = None
@@ -255,6 +293,8 @@ cdef class MergedFeed:
 
     def __dealloc__(self):
         cdef bint joined
+        self._stop_dispatch_threads()
+        self._stop_gap_report_thread()
         if self._bridge is not NULL:
             with nogil:
                 joined = self._bridge.close()
@@ -285,12 +325,16 @@ cdef class MergedFeed:
     property on_tick:
         def __set__(self, cb):
             self._on_tick = cb 
-            self._bridge.set_tick_callback(<PyObject*>cb)
+            #self._bridge.set_tick_callback(<PyObject*>cb)
+            if self._dispatch_mode == DispatchMode.INLINE:
+                self._bridge.set_tick_callback(<PyObject*>cb)
 
     property on_candle:
         def __set__(self, cb):
             self._on_candle = cb
-            self._bridge.set_candle_callback(<PyObject*>cb)
+            #self._bridge.set_candle_callback(<PyObject*>cb)
+            if self._dispatch_mode == DispatchMode.INLINE:
+                self._bridge.set_candle_callback(<PyObject*>cb)
 
 
     property on_order:
@@ -333,6 +377,16 @@ cdef class MergedFeed:
         def __set__(self, cb):
             self._on_log = cb
             self._bridge.set_log_callback(<PyObject*>cb)
+    
+    property on_candle_gap:
+        def __set__(self, cb):
+            self._on_candle_gap = cb
+            self._bridge.set_candle_gap_callback(<PyObject*>cb)
+
+    property on_candle_gap_report:
+        def __set__(self, cb):
+            self._on_candle_gap_report = cb
+            self._ensure_gap_report_thread()
 
     cpdef object _enable_async_ticks(self):
         self._bridge.set_tick_queue_limits(<size_t>self._tick_queue_capacity, self._tick_queue_overwrite)
@@ -373,6 +427,32 @@ cdef class MergedFeed:
     def dropped_candles(self):
         return self._bridge.dropped_candles()
 
+    cpdef object _enable_async_gap_reports(self):
+        self._bridge.set_gap_report_queue_limits(
+            <size_t>self._gap_report_queue_capacity, self._gap_report_queue_overwrite
+        )
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.connect(sock.getsockname())
+        sock.setblocking(False)
+        self._notify_gap_report_sock = sock
+        self._bridge.enable_async_gap_reports(sock.fileno())
+        return sock
+
+    @property
+    def dropped_gap_reports(self):
+        return self._bridge.dropped_gap_reports()
+
+    cpdef object _pop_gap_report(self):
+        return _steal(self._bridge.pop_gap_report_as_pydict())
+
+    cpdef void _begin_gap_reports_wait(self):
+        self._bridge.begin_gap_reports_wait()
+
+    cpdef void _end_gap_reports_wait(self):
+        self._bridge.end_gap_reports_wait()
+
     cpdef object _pop_candle(self):
         return _steal(self._bridge.pop_candle_as_py())
 
@@ -381,6 +461,135 @@ cdef class MergedFeed:
 
     cpdef void _end_candles_wait(self):
         self._bridge.end_candles_wait()
+
+    def _gap_report_worker(self):
+        sock = self._notify_gap_report_sock
+        stop = self._dispatch_stop
+        while not stop.is_set():
+            self._begin_gap_reports_wait()
+            payload = self._pop_gap_report()
+            if payload is not None:
+                self._end_gap_reports_wait()
+                cb = self._on_candle_gap_report
+                if cb is not None:
+                    try:
+                        cb(payload)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    sock.recv(64)
+                except OSError:
+                    self._end_gap_reports_wait()
+                    return
+                self._end_gap_reports_wait()
+
+    def _ensure_gap_report_thread(self):
+        if self._gap_report_thread is not None:
+            return
+        self._notify_gap_report_sock = self._enable_async_gap_reports()
+        self._notify_gap_report_sock.setblocking(True)
+        self._gap_report_thread = threading.Thread(
+            target=self._gap_report_worker, name="fsticker-gap-report-dispatch", daemon=True
+        )
+        self._gap_report_thread.start()
+
+    def _stop_gap_report_thread(self):
+        self._dispatch_stop.set()
+        if self._gap_report_thread is not None and self._notify_gap_report_sock is not None:
+            try:
+                self._notify_gap_report_sock.send(b"\0")
+            except OSError:
+                pass
+        if self._gap_report_thread is not None:
+            self._gap_report_thread.join(timeout=5.0)
+            self._gap_report_thread = None
+
+    def _tick_worker(self):
+        sock = self._notify_sock
+        stop = self._dispatch_stop
+        while not stop.is_set():
+            self._begin_ticks_wait()
+            tick = self._pop_tick()
+            if tick is not None:
+                self._end_ticks_wait()
+                cb = self._on_tick
+                if cb is not None:
+                    try:
+                        cb(tick)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    sock.recv(64)
+                except OSError:
+                    self._end_ticks_wait()
+                    return
+                self._end_ticks_wait()
+
+    def _candle_worker(self):
+        sock = self._notify_candle_sock
+        stop = self._dispatch_stop
+        while not stop.is_set():
+            self._begin_candles_wait()
+            payload = self._pop_candle()
+            if payload is not None:
+                self._end_candles_wait()
+                cb = self._on_candle
+                if cb is not None:
+                    try:
+                        cb(payload)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    sock.recv(64)
+                except OSError:
+                    self._end_candles_wait()
+                    return
+                self._end_candles_wait()
+
+    def _start_dispatch_threads(self):
+        if self._dispatch_mode != DispatchMode.QUEUED:
+            return
+        self._dispatch_stop.clear()
+        
+        if self._on_tick is not None:
+            self._notify_sock = self._enable_async_ticks()
+            self._notify_sock.setblocking(True)
+            self._tick_thread = threading.Thread(
+                target=self._tick_worker, name="fsticker-tick-dispatch", daemon=True
+            )
+            self._tick_thread.start()
+        if self._on_candle is not None:
+            self._notify_candle_sock = self._enable_async_candles()
+            self._notify_candle_sock.setblocking(True)
+            self._candle_thread = threading.Thread(
+                target=self._candle_worker, name="fsticker-candle-dispatch", daemon=True
+            )
+            self._candle_thread.start()
+
+    def _stop_dispatch_threads(self):
+        self._dispatch_stop.set()
+        if self._tick_thread is not None and self._notify_sock is not None:
+            try:
+                self._notify_sock.send(b"\0")
+            except OSError:
+                pass
+        if self._candle_thread is not None and self._notify_candle_sock is not None:
+            try:
+                self._notify_candle_sock.send(b"\0")
+            except OSError:
+                pass
+        if self._tick_thread is not None:
+            self._tick_thread.join(timeout=5.0)
+            self._tick_thread = None
+        if self._candle_thread is not None:
+            self._candle_thread.join(timeout=5.0)
+            self._candle_thread = None
 
 
     cpdef void start(
@@ -393,7 +602,9 @@ cdef class MergedFeed:
         object on_close=None, 
         object on_stalled=None, 
         object on_shutdown=None,
-        object on_log=None
+        object on_log=None,
+        object on_candle_gap=None,
+        object on_candle_gap_report=None
     ):
         if on_tick     is not None: 
             self.on_tick     = on_tick
@@ -413,6 +624,12 @@ cdef class MergedFeed:
             self.on_shutdown = on_shutdown
         if on_log      is not None:
             self.on_log      = on_log
+        if on_candle_gap is not None:
+            self.on_candle_gap = on_candle_gap
+        if on_candle_gap_report is not None:
+            self.on_candle_gap_report = on_candle_gap_report
+
+        self._start_dispatch_threads()
 
         self._bridge.start()
         self._started = True
@@ -476,29 +693,33 @@ cdef class MergedFeed:
             raise RuntimeError("MergedFeed.run() called before start()")
         grace_ms = 0.0 if grace_ms < 0.0 else (2.0e9 if grace_ms > 2.0e9 else grace_ms)
 
-        if handle_signals:
-            if not main_thread:
-                raise RuntimeError("run(handle_signals=True) needs the main thread; "
-                                   "pass handle_signals=False")
-            with nogil:
-                rc = self._bridge.run(True, <int>grace_ms)
-            if rc == -3:
-                raise RuntimeError("another MergedFeed.run() already handles SIGINT/SIGTERM; "
-                                   "pass handle_signals=False")
-            if rc == -4:
-                raise RuntimeError("fsticker: internal error while waiting for shutdown")
-            if rc > 0:
-                self._bridge.reraise(rc)
-                PyErr_CheckSignals()  
-        else:
-            try:
-                self._bridge.run_passive(main_thread)
-                closed = True
-            finally:
-                if not closed:
-                    self.stop()
+        try:
+            if handle_signals:
+                if not main_thread:
+                    raise RuntimeError("run(handle_signals=True) needs the main thread; "
+                                       "pass handle_signals=False")
                 with nogil:
-                    self._bridge.join_all()
+                    rc = self._bridge.run(True, <int>grace_ms)
+                if rc == -3:
+                    raise RuntimeError("another MergedFeed.run() already handles SIGINT/SIGTERM; "
+                                       "pass handle_signals=False")
+                if rc == -4:
+                    raise RuntimeError("fsticker: internal error while waiting for shutdown")
+                if rc > 0:
+                    self._bridge.reraise(rc)
+                    PyErr_CheckSignals()  
+            else:
+                try:
+                    self._bridge.run_passive(main_thread)
+                    closed = True
+                finally:
+                    if not closed:
+                        self.stop()
+                    with nogil:
+                        self._bridge.join_all()
+        finally:
+            self._stop_dispatch_threads()
+            self._stop_gap_report_thread()
 
     @property
     def broker_count(self):

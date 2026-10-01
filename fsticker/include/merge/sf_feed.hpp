@@ -25,12 +25,14 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -42,6 +44,26 @@ namespace fsticker::merge {
         std::string              name;
         fsticker::Credentials    credentials;
         fsticker::Ticker::Params params {};
+    };
+
+    struct CandleGap {
+        std::string                                        broker;
+        std::vector<std::string>                           tokens;
+        std::vector<std::pair<std::int64_t, std::int64_t>> periods;
+    };
+
+    struct CandleGapReport {
+        struct PeriodReport {
+            std::int64_t              period;
+            std::vector<std::int64_t> partial;
+            bool                      has_range = false;
+            std::int64_t              start     = 0;
+            std::int64_t              end       = 0;
+        };
+
+        std::string               token;
+        std::string               broker;
+        std::vector<PeriodReport> periods;
     };
 
     class MergedFeed : public std::enable_shared_from_this<MergedFeed> {
@@ -60,6 +82,8 @@ namespace fsticker::merge {
         using ShutdownCallback = std::function<void()>;
         using LogCallback =
             std::function<void(const std::string &broker, int level, std::string_view message)>;
+        using CandleGapCallback       = std::function<void(const CandleGap &)>;
+        using CandleGapReportCallback = std::function<void(const CandleGapReport &)>;
 
         MergedFeed(net::io_context        &control_ioc,
                    std::vector<BrokerSpec> brokers) : specs_(std::move(brokers)),
@@ -106,6 +130,14 @@ namespace fsticker::merge {
             const bool needs_timer = std::any_of(
                 specs.begin(), specs.end(), [](const TimeframeSpec &s) { return s.auto_finalize; });
 
+            {
+                std::lock_guard<std::mutex> lk(track_mutex_);
+                gap_periods_.clear();
+                for (const auto &s : specs)
+                    gap_periods_.push_back(s.period.count());
+                gap_anchors_ = anchors;
+            }
+
             CandleCallback dispatch = [this, cb = std::move(cb)](const std::vector<Candle> &batch) {
                 if (timescale_)
                     timescale_->on_candle(batch);
@@ -117,6 +149,7 @@ namespace fsticker::merge {
                 candle_.emplace(std::move(specs), std::move(dispatch), std::move(anchors));
                 candle_needs_timer_ = needs_timer;
             }
+            kick_candle_thread();
             if (needs_timer && started_.load(std::memory_order_acquire))
                 ensure_candle_thread();
         }
@@ -158,6 +191,14 @@ namespace fsticker::merge {
             on_log_ = std::move(cb);
         }
 
+        void set_candle_gap_callback(CandleGapCallback cb) {
+            on_gap_ = std::move(cb);
+        }
+
+        void set_candle_gap_report_callback(CandleGapReportCallback cb) {
+            on_gap_report_ = std::move(cb);
+        }
+
         void set_wake_callback(std::function<void()> cb) {
             wake_ = std::move(cb);
         }
@@ -170,13 +211,19 @@ namespace fsticker::merge {
                 candle_.reset();
                 timescale_.reset();
             }
-            on_order_    = nullptr;
-            on_error_    = nullptr;
-            on_open_     = nullptr;
-            on_close_    = nullptr;
-            on_stalled_  = nullptr;
-            on_shutdown_ = nullptr;
-            on_log_      = nullptr;
+            on_order_      = nullptr;
+            on_error_      = nullptr;
+            on_open_       = nullptr;
+            on_close_      = nullptr;
+            on_stalled_    = nullptr;
+            on_shutdown_   = nullptr;
+            on_log_        = nullptr;
+            on_gap_        = nullptr;
+            on_gap_report_ = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(track_mutex_);
+                pending_outage_.clear();
+            }
 
             for (auto &b : brokers_)
                 if (b.ticker)
@@ -276,6 +323,11 @@ namespace fsticker::merge {
                 if (!target.empty() && target != b.name)
                     continue;
                 b.ticker->subscribe(instruments, feed_type);
+                {
+                    std::lock_guard<std::mutex> lk(track_mutex_);
+                    auto                       &set = broker_tokens_[b.name];
+                    set.insert(instruments.begin(), instruments.end());
+                }
             }
         }
 
@@ -286,6 +338,13 @@ namespace fsticker::merge {
                 if (!target.empty() && target != b.name)
                     continue;
                 b.ticker->unsubscribe(instruments, feed_type);
+
+                {
+                    std::lock_guard<std::mutex> lk(track_mutex_);
+                    auto                       &set = broker_tokens_[b.name];
+                    for (const auto &i : instruments)
+                        set.erase(i);
+                }
 
                 net::post(*b.ioc, [&b, instruments] {
                     for (const auto &instrument : instruments)
@@ -366,6 +425,10 @@ namespace fsticker::merge {
                 std::make_unique<std::atomic<bool>>(false);
         };
 
+        struct PendingOutage {
+            std::vector<CandleEngine::OpenBucketInfo> buckets;
+        };
+
         void wire_broker(std::size_t index, const BrokerSpec &spec) {
             auto             self       = shared_from_this();
             net::io_context &broker_ioc = *brokers_[index].ioc;
@@ -384,9 +447,46 @@ namespace fsticker::merge {
                     merged = self->store_.diff_and_update(std::move(*tick));
                 }
                 if (merged) {
-                    std::lock_guard<std::mutex> lock(self->candle_mutex_);
-                    if (self->candle_)
-                        self->candle_->on_tick(*merged);
+                    const std::string instrument_key =
+                        get_string(*merged, "e") + "|" + get_string(*merged, "tk");
+
+
+                    std::optional<PendingOutage> resumed;
+                    std::int64_t                 anchor = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(self->track_mutex_);
+                        const auto                  it = self->pending_outage_.find(instrument_key);
+                        if (it != self->pending_outage_.end()) {
+                            resumed = std::move(it->second);
+                            self->pending_outage_.erase(it);
+                            anchor = self->anchor_of(instrument_key);
+                        }
+                    }
+                    bool wake_finalizer = false;
+                    {
+                        std::lock_guard<std::mutex> lock(self->candle_mutex_);
+                        if (self->candle_) {
+                            self->candle_->on_tick(*merged);
+                            wake_finalizer = self->candle_->consume_earlier_deadline_flag();
+
+                            if (resumed) {
+                                const auto ft_opt = get_int(*merged, "ft");
+                                if (ft_opt)
+                                    for (const auto &b : resumed->buckets) {
+                                        const std::int64_t resume_bucket =
+                                            CandleEngine::bucket_start(*ft_opt, anchor, b.period_s);
+                                        if (*ft_opt > resume_bucket)
+                                            self->candle_->mark_suspect(instrument_key, b.slot_index);
+                                    }
+                            }
+                        }
+                    }
+                    if (wake_finalizer)
+                        self->kick_candle_thread();
+
+                    if (resumed)
+                        self->build_and_fire_gap_report(instrument_key, self->brokers_[index].name,
+                                                        *merged, *resumed);
                 }
                 if (merged && self->on_tick_)
                     self->on_tick_(*merged);
@@ -401,12 +501,14 @@ namespace fsticker::merge {
             };
             callbacks.open_callback = [self, index](const char *data, std::size_t size) {
                 self->notify_wake();
+                self->note_broker_connected(self->brokers_[index].name);
                 if (self->on_open_)
                     self->on_open_(self->brokers_[index].name, data, size);
             };
             callbacks.close_callback = [self, index] {
                 if (self->on_close_)
                     self->on_close_(self->brokers_[index].name);
+                self->note_broker_down(self->brokers_[index].name);
             };
             callbacks.stalled_callback = [self, index](std::uint32_t n) {
                 if (self->on_stalled_)
@@ -445,11 +547,32 @@ namespace fsticker::merge {
                 t.join();
         }
 
+        void kick_candle_thread() {
+            {
+                std::lock_guard<std::mutex> lock(candle_thread_mutex_);
+                candle_thread_kick_ = true;
+            }
+            candle_thread_cv_.notify_all();
+        }
+
         void candle_thread_main() {
             std::unique_lock<std::mutex> lock(candle_thread_mutex_);
             while (!candle_thread_stop_) {
-                candle_thread_cv_.wait_for(lock, std::chrono::seconds(1),
-                                           [this] { return candle_thread_stop_; });
+                candle_thread_kick_ = false;
+                std::optional<std::int64_t> deadline;
+                {
+                    std::lock_guard<std::mutex> g(candle_mutex_);
+                    if (candle_)
+                        deadline = candle_->next_deadline();
+                }
+                const auto ready = [this] { return candle_thread_stop_ || candle_thread_kick_; };
+                if (!deadline)
+                    candle_thread_cv_.wait(lock, ready); // nothing pending: sleep until kicked
+                else
+                    candle_thread_cv_.wait_until(
+                        lock,
+                        std::chrono::system_clock::time_point {std::chrono::seconds {*deadline}},
+                        ready);
                 if (candle_thread_stop_)
                     break;
                 lock.unlock();
@@ -519,6 +642,150 @@ namespace fsticker::merge {
             // std::thread([self] { self->reap_worker_threads(std::chrono::seconds(5)); }).detach();
         }
 
+        void note_broker_connected(const std::string &broker) {
+            std::lock_guard<std::mutex> lk(track_mutex_);
+            connected_.insert(broker);
+        }
+
+        [[nodiscard]] std::int64_t anchor_of(const std::string &token) const {
+            const auto bar = token.find('|');
+            const auto it  = gap_anchors_.find(token.substr(0, bar));
+            return it == gap_anchors_.end() ? 0 : it->second;
+        }
+
+        void note_broker_down(const std::string &broker) {
+            std::vector<std::string> affected_tokens;
+            {
+                std::lock_guard<std::mutex> lk(track_mutex_);
+                if (connected_.erase(broker) == 0)
+                    return;
+                const auto mine = broker_tokens_.find(broker);
+                if (mine == broker_tokens_.end())
+                    return;
+                for (const auto &tok : mine->second) {
+                    bool covered = false;
+                    for (const auto &other : connected_) {
+                        const auto o = broker_tokens_.find(other);
+                        if (o != broker_tokens_.end() && o->second.count(tok)) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (!covered)
+                        affected_tokens.push_back(tok);
+                }
+            }
+            if (affected_tokens.empty())
+                return;
+
+
+            {
+                std::lock_guard<std::mutex> lock(candle_mutex_);
+                if (candle_) {
+                    std::lock_guard<std::mutex> lk(track_mutex_);
+                    for (const auto &tok : affected_tokens) {
+                        auto buckets = candle_->open_buckets(tok);
+                        for (const auto &b : buckets)
+                            if (b.is_open)
+                                candle_->mark_suspect(tok, b.slot_index);
+                        pending_outage_[tok] = PendingOutage {std::move(buckets)};
+                    }
+                }
+            }
+
+            if (!on_gap_ || gap_periods_.empty())
+                return;
+            std::vector<CandleGap> events;
+            {
+                std::lock_guard<std::mutex>                      lk(track_mutex_);
+                std::map<std::int64_t, std::vector<std::string>> by_anchor;
+                for (const auto &tok : affected_tokens)
+                    by_anchor[anchor_of(tok)].push_back(tok);
+
+                const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                for (auto &[anchor, toks] : by_anchor) {
+                    CandleGap g;
+                    g.broker = broker;
+                    g.tokens = std::move(toks);
+                    for (const auto p : gap_periods_)
+                        g.periods.emplace_back(p, CandleEngine::bucket_start(now, anchor, p));
+                    events.push_back(std::move(g));
+                }
+            }
+            for (const auto &e : events)
+                on_gap_(e);
+        }
+
+        void build_and_fire_gap_report(const std::string   &instrument_key,
+                                       const std::string   &broker,
+                                       const Tick          &merged,
+                                       const PendingOutage &outage) {
+            if (!on_gap_report_)
+                return;
+            const auto ft_opt = get_int(merged, "ft");
+            if (!ft_opt)
+                return;
+            const std::int64_t resume_ft = *ft_opt;
+            const std::int64_t anchor    = anchor_of(instrument_key);
+
+            CandleGapReport report;
+            report.token  = instrument_key;
+            report.broker = broker;
+
+            for (const auto &b : outage.buckets) {
+                const std::int64_t period_s = b.period_s;
+                const std::int64_t baseline = b.is_open ? b.period_start : b.closed_through;
+                if (baseline == -1)
+                    continue;
+
+                const std::int64_t resume_bucket =
+                    CandleEngine::bucket_start(resume_ft, anchor, period_s);
+                const bool         disc_partial   = b.is_open;
+                const bool         resume_partial = resume_ft > resume_bucket;
+                const std::int64_t missing_start  = baseline + period_s;
+                const std::int64_t missing_end    = resume_bucket - period_s;
+                const bool         has_missing    = missing_start <= missing_end;
+
+                CandleGapReport::PeriodReport pr;
+                pr.period = period_s;
+
+                if (b.omit_possible_partial) {
+                    std::vector<std::int64_t> bounds;
+                    if (disc_partial)
+                        bounds.push_back(b.period_start);
+                    if (has_missing) {
+                        bounds.push_back(missing_start);
+                        bounds.push_back(missing_end);
+                    }
+                    if (resume_partial)
+                        bounds.push_back(resume_bucket);
+                    if (bounds.empty())
+                        continue;
+                    pr.has_range = true;
+                    pr.start     = bounds.front();
+                    pr.end       = bounds.back();
+                } else {
+                    if (disc_partial)
+                        pr.partial.push_back(b.period_start);
+                    if (resume_partial && (pr.partial.empty() || pr.partial.back() != resume_bucket))
+                        pr.partial.push_back(resume_bucket);
+                    if (has_missing) {
+                        pr.has_range = true;
+                        pr.start     = missing_start;
+                        pr.end       = missing_end;
+                    }
+                    if (pr.partial.empty() && !pr.has_range)
+                        continue;
+                }
+                report.periods.push_back(std::move(pr));
+            }
+
+            if (!report.periods.empty())
+                on_gap_report_(report);
+        }
+
         void notify_wake() const {
             if (wake_)
                 wake_();
@@ -539,16 +806,26 @@ namespace fsticker::merge {
         std::mutex              candle_thread_mutex_;
         std::condition_variable candle_thread_cv_;
         bool                    candle_thread_stop_ = false;
+        bool                    candle_thread_kick_ = false;
         std::thread             candle_thread_;
 
-        TickCallback     on_tick_;
-        OrderCallback    on_order_;
-        ErrorCallback    on_error_;
-        OpenCallback     on_open_;
-        CloseCallback    on_close_;
-        StalledCallback  on_stalled_;
-        ShutdownCallback on_shutdown_;
-        LogCallback      on_log_;
+        TickCallback            on_tick_;
+        OrderCallback           on_order_;
+        ErrorCallback           on_error_;
+        OpenCallback            on_open_;
+        CloseCallback           on_close_;
+        StalledCallback         on_stalled_;
+        ShutdownCallback        on_shutdown_;
+        LogCallback             on_log_;
+        CandleGapCallback       on_gap_;
+        CandleGapReportCallback on_gap_report_;
+
+        std::mutex                                                       track_mutex_;
+        std::unordered_map<std::string, std::unordered_set<std::string>> broker_tokens_;
+        std::unordered_set<std::string>                                  connected_;
+        std::vector<std::int64_t>                                        gap_periods_;
+        ExchangeAnchors                                                  gap_anchors_;
+        std::unordered_map<std::string, PendingOutage>                   pending_outage_;
 
         std::atomic<std::size_t> pending_shutdowns_ {0};
         std::atomic<bool>        signals_installed_ {false};

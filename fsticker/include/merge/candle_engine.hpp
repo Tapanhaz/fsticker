@@ -25,6 +25,7 @@ namespace fsticker::merge {
 
         bool                 auto_finalize = false;
         std::chrono::seconds auto_finalize_grace {4};
+        bool                 omit_possible_partial = false;
     };
 
     using ExchangeAnchors = std::unordered_map<std::string, std::int64_t>;
@@ -71,6 +72,9 @@ namespace fsticker::merge {
             if (!ft)
                 return;
 
+            const std::string tag    = get_string(tick, "t");
+            const bool        is_ack = (tag == "tk" || tag == "dk");
+
             const std::string exchange = get_string(tick, "e");
             const std::string token    = get_string(tick, "tk");
             const std::string ts       = get_string(tick, "ts");
@@ -98,7 +102,7 @@ namespace fsticker::merge {
 
             for (std::size_t i = 0; i < specs_.size(); ++i)
                 update(key, inst.slots[i], specs_[i], i, exchange, token, inst.trading_symbol, *ft,
-                       anchor, price, inst.last_volume, inst.last_oi);
+                       anchor, price, inst.last_volume, inst.last_oi, is_ack);
         }
 
         void check_late_candles(std::int64_t now_epoch_s) {
@@ -118,18 +122,76 @@ namespace fsticker::merge {
                 if (!slot.current.initialized || slot.current.period_start != pf.expected_period_start)
                     continue;
 
-                const TimeframeSpec &spec = specs_[pf.slot_index];
-                on_candle_({make(inst.exchange, inst.token, inst.trading_symbol, spec.period.count(),
-                                 slot.current, CandleState::Complete, spec.live, false)});
+                const TimeframeSpec &spec     = specs_[pf.slot_index];
+                const bool           suppress = spec.omit_possible_partial && slot.suspect;
+                if (!suppress)
+                    on_candle_(
+                        {make(inst.exchange, inst.token, inst.trading_symbol, spec.period.count(),
+                              slot.current, CandleState::Complete, spec.live, false)});
                 slot.previous       = slot.current;
                 slot.previous_valid = false;
                 slot.closed_through = slot.current.period_start;
+                slot.suspect        = false;
                 slot.current        = Bucket {};
             }
         }
 
         void forget(const std::string &instrument) {
             table_.erase(instrument);
+        }
+
+        struct OpenBucketInfo {
+            std::size_t  slot_index;
+            std::int64_t period_s;
+            bool         is_open;
+            std::int64_t period_start;
+            std::int64_t closed_through;
+            bool         omit_possible_partial;
+        };
+
+        [[nodiscard]] std::vector<OpenBucketInfo> open_buckets(const std::string &instrument_key) const {
+            std::vector<OpenBucketInfo> out;
+            const auto                  it = table_.find(instrument_key);
+            if (it == table_.end())
+                return out;
+            const Instrument &inst = it->second;
+            out.reserve(specs_.size());
+            for (std::size_t i = 0; i < specs_.size() && i < inst.slots.size(); ++i) {
+                const Slot &slot = inst.slots[i];
+                out.push_back({i, specs_[i].period.count(), slot.current.initialized,
+                               slot.current.period_start, slot.closed_through,
+                               specs_[i].omit_possible_partial});
+            }
+            return out;
+        }
+
+        void mark_suspect(const std::string &instrument_key, std::size_t slot_index) {
+            const auto it = table_.find(instrument_key);
+            if (it == table_.end() || slot_index >= it->second.slots.size())
+                return;
+            Slot &slot = it->second.slots[slot_index];
+            if (slot.current.initialized)
+                slot.suspect = true;
+            else
+                slot.mark_next_open_suspect = true;
+        }
+
+        [[nodiscard]] static std::int64_t bucket_start(std::int64_t ft,
+                                                       std::int64_t anchor,
+                                                       std::int64_t period_s) noexcept {
+            return period_start_for(ft, anchor, period_s);
+        }
+
+        [[nodiscard]] std::optional<std::int64_t> next_deadline() const {
+            if (pending_finalize_.empty())
+                return std::nullopt;
+            return pending_finalize_.begin()->first;
+        }
+
+        [[nodiscard]] bool consume_earlier_deadline_flag() noexcept {
+            const bool f      = earlier_deadline_;
+            earlier_deadline_ = false;
+            return f;
         }
 
     private:
@@ -149,7 +211,9 @@ namespace fsticker::merge {
             Bucket previous;
             bool   previous_valid = false;
 
-            std::int64_t closed_through = -1;
+            std::int64_t closed_through         = -1;
+            bool         suspect                = false;
+            bool         mark_next_open_suspect = false;
         };
 
         struct Instrument {
@@ -202,7 +266,8 @@ namespace fsticker::merge {
                     std::int64_t          anchor,
                     std::optional<double> price,
                     std::int64_t          volume,
-                    std::int64_t          oi) {
+                    std::int64_t          oi,
+                    bool                  is_ack) {
             const std::int64_t period_s = spec.period.count();
             if (period_s <= 0)
                 return;
@@ -214,13 +279,20 @@ namespace fsticker::merge {
             if (slot.current.initialized && period_start < slot.current.period_start)
                 return;
 
+            if (is_ack && !slot.current.initialized && slot.closed_through == -1)
+                return;
 
-            bool is_new_candle = false;
+
+            bool is_new_candle       = false;
+            bool suppress_this_close = false;
             if (slot.current.initialized && period_start > slot.current.period_start) {
+                suppress_this_close = spec.omit_possible_partial && slot.suspect;
+
                 slot.previous       = slot.current;
                 slot.previous_valid = true;
                 slot.closed_through = slot.current.period_start;
                 slot.current        = Bucket {};
+                slot.suspect        = false;
                 is_new_candle       = true;
             } else if (!slot.current.initialized) {
                 slot.current.period_start = period_start;
@@ -235,10 +307,19 @@ namespace fsticker::merge {
 
                     is_new_candle = true;
 
-                    if (spec.auto_finalize)
+                    if (slot.mark_next_open_suspect) {
+                        slot.suspect                = true;
+                        slot.mark_next_open_suspect = false;
+                    }
+
+                    if (spec.auto_finalize) {
+                        const std::int64_t deadline =
+                            period_start + period_s + spec.auto_finalize_grace.count();
+                        if (pending_finalize_.empty() || deadline < pending_finalize_.begin()->first)
+                            earlier_deadline_ = true;
                         pending_finalize_.emplace(
-                            period_start + period_s + spec.auto_finalize_grace.count(),
-                            PendingFinalize {instrument_key, slot_index, period_start});
+                            deadline, PendingFinalize {instrument_key, slot_index, period_start});
+                    }
                 } else {
                     c.high  = std::max(c.high, *price);
                     c.low   = std::min(c.low, *price);
@@ -257,7 +338,7 @@ namespace fsticker::merge {
 
             if (spec.live) {
                 std::vector<Candle> msg;
-                if (is_new_candle && slot.previous_valid)
+                if (is_new_candle && slot.previous_valid && !suppress_this_close)
                     msg.push_back(make(exchange, token, ts, period_s, slot.previous,
                                        CandleState::Complete, true, false));
                 if (slot.current.initialized)
@@ -265,7 +346,8 @@ namespace fsticker::merge {
                                        CandleState::Partial, true, is_new_candle));
                 if (!msg.empty())
                     on_candle_(msg);
-            } else if (is_new_candle && slot.previous_valid) {
+            } else if (is_new_candle && slot.previous_valid && !suppress_this_close) {
+
                 on_candle_({make(exchange, token, ts, period_s, slot.previous,
                                  CandleState::Complete, false, false)});
             }
@@ -279,6 +361,7 @@ namespace fsticker::merge {
                                          CandleState        state,
                                          bool               live,
                                          bool               is_new) {
+
             Candle c;
             c.exchange       = exchange;
             c.token          = token;
@@ -303,6 +386,7 @@ namespace fsticker::merge {
         ExchangeAnchors                              anchors_;
         std::unordered_map<std::string, Instrument>  table_;
         std::multimap<std::int64_t, PendingFinalize> pending_finalize_;
+        bool                                         earlier_deadline_ = false;
     };
 
 } // namespace fsticker::merge

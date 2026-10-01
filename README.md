@@ -1,6 +1,6 @@
 # fsticker
 
-[![PyPI](https://img.shields.io/pypi/v/fsticker.svg)](https://pypi.org/project/fsticker/)
+[![PyPI](https://img.shields.io/pypi/v/fsticker.svg?color=blue)](https://pypi.org/project/fsticker/)
 [![Downloads](https://static.pepy.tech/badge/fsticker)](https://pepy.tech/project/fsticker)
 [![Python versions](https://img.shields.io/pypi/pyversions/fsticker.svg)](https://pypi.org/project/fsticker/)
 [![Build](https://github.com/Tapanhaz/fsticker/actions/workflows/build.yml/badge.svg)](https://github.com/Tapanhaz/fsticker/actions/workflows/build.yml)
@@ -197,11 +197,28 @@ an optional 4th element, `(period, live, auto_finalize, auto_finalize_grace_seco
 - `auto_finalize_grace_seconds` (optional, default `4.0`) — how long
   after the timeframe boundary `auto_finalize=True` waits before
   force-emitting the candle. Only relevant when `auto_finalize=True`.
+- `omit_possible_partial` (optional, default `False`) — when every
+  broker carrying a token disconnects and later reconnects, any candle
+  that may only reflect PART of its real period is silently dropped
+  instead of emitted. This covers both ends of the outage: the candle
+  that was still forming when every carrier went down (its tail is cut
+  off), and the candle that resumes after reconnect if its own first
+  tick landed after that candle's own start (its head is cut off).
+  Never affects a token's genuine first-ever candle (e.g. you were
+  already connected when the market opened, or you just started your
+  script) — `fsticker` only ever omits a candle when it has CONFIRMED
+  knowledge of an outage (a broker that was connected, went down, and
+  came back); it never guesses based on timing alone, since a quiet
+  instrument's genuine first trade of a period looks identical to a
+  late-joining connection and there is no honest way to tell them apart.
 
 eg. `[(60, True, True)]` — 1-minute, live partials + completed,
 auto-finalized after the default 4s grace.
 eg. `[(60, True, True, 10.0)]` — same, but with a 10s grace period
 instead of the default.
+eg. `[(60, False, False, 4.0, True)]` — 1-minute, closed-only, and
+drop any candle a confirmed full-outage reconnect gap left possibly
+partial.
 
 When provided, `candle_timeframes` activates the candle engine, which is
 inert by default. Candles are constructed from the same deduplicated
@@ -359,6 +376,73 @@ Registers callbacks and begins connecting every configured broker:
 | `on_open`     | `(broker, payload)` on connect       |
 | `on_close`    | `(broker,)` on disconnect            |
 | `on_stalled`  | `(broker, consecutive_failures)`     |
+| `on_candle_gap` | one dict, see below                |
+| `on_candle_gap_report` | one dict, see below          |
+
+**`on_candle_gap`** fires when a broker disconnect leaves one or more
+tokens with *no* connected broker, so the candles currently forming for
+them are missing ticks. A token still carried by another live broker
+never appears. Requires `candle_timeframes`.
+
+```python
+{
+    "broker": "shoonya",  # ================>  the disconnect of the broker that took 
+    "tokens": ["NSE|26000", "NSE|26009"],   # the last carrier tokens that went dark
+    "periods": [                            # candle buckets open at that moment
+        {"period": 60,  "time": 1790238960},
+        {"period": 300, "time": 1790238900},
+    ],
+}
+```
+
+`period`/`time` match the fields in `on_candle`, so you can key straight
+into your stored candles, e.g. to schedule a historical fetch after the
+bucket closes and replace that row. It runs inline on the broker's
+thread: hand real work off to your own thread. Tokens with different
+exchange session anchors (e.g. NSE and MCX) produce one event per anchor
+group.
+
+**`on_candle_gap_report`** fires once per token, the moment it resumes
+ticking after a confirmed full outage — the after-the-fact companion to
+`on_candle_gap`'s real-time signal. One event covers every configured
+timeframe for that token together. Unlike every other callback, this one
+is *always* dispatched off a dedicated background thread, regardless of
+`dispatch_mode`.
+
+```python
+# omit_possible_partial=False (default) for this timeframe:
+{
+    "token": "NSE|26000",
+    "broker": "shoonya",             # whichever carrier's tick resumed data first
+    "periods": [
+        {
+            "period": 60,
+            "partial": [1790238900, 1790239260],  # candle(s) STILL EMITTED but possibly incomplete
+            "start": 1790238960,                  # candles fully skipped in between (if any) --
+            "end": 1790239200,                    # "start"/"end" are absent if none were skipped
+        },
+    ],
+}
+
+# omit_possible_partial=True for this timeframe:
+{
+    "token": "NSE|26000",
+    "broker": "shoonya",
+    "periods": [
+        {"period": 60, "start": 1790238900, "end": 1790238900},  # everything in [start, end]
+                                                                  # was DROPPED, not emitted
+    ],
+}
+```
+
+A timeframe only appears in `periods` if there's something to report —
+a clean reconnect that landed exactly on a candle boundary with no
+candle skipped produces no entry at all. `start`/`end` mark a span of
+candle-start timestamps (inclusive), same as `period`/`time` elsewhere —
+never an enumerated list of every missing candle. `partial` never
+appears when `omit_possible_partial=True` for that timeframe, since
+nothing partial reaches the output in that mode.
+
 
 Every callback is optional and independent — a sync `def` or `async def`
 callback both work in async implementation.
