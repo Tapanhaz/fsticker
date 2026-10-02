@@ -505,10 +505,11 @@ namespace fsticker::merge {
                 if (self->on_open_)
                     self->on_open_(self->brokers_[index].name, data, size);
             };
-            callbacks.close_callback = [self, index] {
+            callbacks.close_callback = [self, index](bool graceful) {
                 if (self->on_close_)
                     self->on_close_(self->brokers_[index].name);
-                self->note_broker_down(self->brokers_[index].name);
+                if (!graceful)
+                    self->note_broker_down(self->brokers_[index].name);
             };
             callbacks.stalled_callback = [self, index](std::uint32_t n) {
                 if (self->on_stalled_)

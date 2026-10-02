@@ -286,7 +286,7 @@ namespace fsticker {
             }
 
             if (was_connected && callbacks_.close_callback)
-                callbacks_.close_callback();
+                callbacks_.close_callback(disconnect_requested_);
 
             if (disconnect_requested_) {
                 initiate_shutdown();

@@ -69,7 +69,7 @@ namespace fsticker {
     using DataCallback    = std::function<void(const char *data, std::size_t size)>;
     using ErrorCallback   = std::function<void(const char *data, std::size_t size)>;
     using OpenCallback    = std::function<void(const char *data, std::size_t size)>;
-    using CloseCallback   = std::function<void()>;
+    using CloseCallback   = std::function<void(bool graceful)>;
     using StalledCallback = std::function<void(std::uint32_t consecutive_failures)>;
     using LogCallback     = std::function<void(int level, std::string_view message)>;
 
