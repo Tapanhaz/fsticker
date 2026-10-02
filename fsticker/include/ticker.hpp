@@ -285,7 +285,7 @@ namespace fsticker {
                         .count();
             }
 
-            if (callbacks_.close_callback)
+            if (was_connected && callbacks_.close_callback)
                 callbacks_.close_callback();
 
             if (disconnect_requested_) {
